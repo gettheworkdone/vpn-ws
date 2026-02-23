@@ -210,6 +210,8 @@ int vpn_ws_client_write(vpn_ws_peer *peer, uint8_t *buf, uint64_t len) {
 
 int vpn_ws_connect(vpn_ws_peer *peer, char *name) {
 	static char *cpy = NULL;
+	char *host_hdr = NULL;
+	char *connect_host = NULL;
 
 	if (cpy) free(cpy);
 	cpy = strdup(name);
@@ -236,7 +238,7 @@ int vpn_ws_connect(vpn_ws_peer *peer, char *name) {
 
 	char *path = NULL;
 
-	// now get the domain part
+	// now get the host part
 	char *domain = cpy + 5 + ssl;
 	size_t domain_len = strlen(domain);
 	char *slash = strchr(domain, '/');
@@ -254,44 +256,103 @@ int vpn_ws_connect(vpn_ws_peer *peer, char *name) {
 		domain_len = strlen(domain);
 	}
 
-	// check for port
-	char *port_str = strchr(domain, ':');
-	if (port_str) {		
-		*port_str = 0;
-		domain_len = strlen(domain);
-		port = atoi(port_str+1);
+	// parse host and optional port, with support for [ipv6]:port
+	char *port_str = NULL;
+	int ipv6_literal = 0;
+	if (domain[0] == '[') {
+		char *close_bracket = strchr(domain, ']');
+		if (!close_bracket) {
+			vpn_ws_warning("invalid websocket url: missing ']' in host");
+			return -1;
+		}
+		ipv6_literal = 1;
+		if (close_bracket[1] == ':') {
+			port_str = close_bracket + 1;
+			*port_str = 0;
+			port = atoi(port_str+1);
+		}
+		domain++;
+		*close_bracket = 0;
+	}
+	else {
+		port_str = strrchr(domain, ':');
+		if (port_str && !strchr(port_str+1, ':')) {
+			*port_str = 0;
+			port = atoi(port_str+1);
+		}
 	}
 
-	vpn_ws_notice("connecting to %s port %u (transport: %s)", domain, port, ssl ? "wss": "ws");
+	domain_len = strlen(domain);
 
-	// resolve the domain
-#ifndef __WIN32__
-	res_init();
-#endif
-	struct hostent *he = gethostbyname(domain);
-	if (!he) {
-		vpn_ws_warning("vpn_ws_connect()/gethostbyname(): unable to resolve name");
+	if (ipv6_literal) {
+		host_hdr = vpn_ws_calloc(domain_len + 3 + (port_str ? strlen(port_str+1) + 1 : 0));
+		if (!host_hdr) return -1;
+		if (port_str) {
+			snprintf(host_hdr, domain_len + 3 + strlen(port_str+1) + 1, "[%s]:%s", domain, port_str+1);
+		}
+		else {
+			snprintf(host_hdr, domain_len + 3, "[%s]", domain);
+		}
+	}
+	else {
+		host_hdr = vpn_ws_calloc(domain_len + 1 + (port_str ? strlen(port_str+1) + 1 : 0));
+		if (!host_hdr) return -1;
+		if (port_str) {
+			snprintf(host_hdr, domain_len + 1 + strlen(port_str+1) + 1, "%s:%s", domain, port_str+1);
+		}
+		else {
+			snprintf(host_hdr, domain_len + 1, "%s", domain);
+		}
+	}
+
+	connect_host = vpn_ws_calloc(domain_len + 1);
+	if (!connect_host) {
+		free(host_hdr);
+		return -1;
+	}
+	snprintf(connect_host, domain_len + 1, "%s", domain);
+
+	vpn_ws_notice("connecting to %s port %u (transport: %s)", connect_host, port, ssl ? "wss": "ws");
+
+	struct addrinfo hints;
+	struct addrinfo *res = NULL;
+	struct addrinfo *rp = NULL;
+	char port_num[6];
+	memset(&hints, 0, sizeof(struct addrinfo));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	snprintf(port_num, sizeof(port_num), "%u", port);
+
+	if (getaddrinfo(connect_host, port_num, &hints, &res)) {
+		vpn_ws_warning("vpn_ws_connect()/getaddrinfo(): unable to resolve name");
+		free(connect_host);
+		free(host_hdr);
 		return -1;
 	}
 
+	for(rp = res; rp != NULL; rp = rp->ai_next) {
 #ifndef __WIN32__
-	peer->fd = socket(AF_INET, SOCK_STREAM, 0);
+		peer->fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
 #else
-	peer->fd = _vpn_ws_win32_socket(AF_INET, SOCK_STREAM, 0);
+		peer->fd = _vpn_ws_win32_socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
 #endif
-	if (vpn_ws_is_invalid_fd(peer->fd)) {
-		vpn_ws_error("vpn_ws_connect()/socket()");
-		return -1;
+		if (vpn_ws_is_invalid_fd(peer->fd)) {
+			continue;
+		}
+
+		if (!connect(vpn_ws_socket_cast(peer->fd), rp->ai_addr, rp->ai_addrlen)) {
+			break;
+		}
+		close(peer->fd);
+		peer->fd = vpn_ws_invalid_fd;
 	}
 
-	struct sockaddr_in sin;
-	memset(&sin, 0, sizeof(struct sockaddr_in));
-	sin.sin_family = AF_INET;
-	sin.sin_port = htons(port);
-	sin.sin_addr = *((struct in_addr *) he->h_addr);
+	freeaddrinfo(res);
 
-	if (connect(vpn_ws_socket_cast(peer->fd), (struct sockaddr *) &sin, sizeof(struct sockaddr_in))) {
+	if (vpn_ws_is_invalid_fd(peer->fd)) {
 		vpn_ws_error("vpn_ws_connect()/connect()");
+		free(connect_host);
+		free(host_hdr);
 		return -1;
 	}
 
@@ -320,11 +381,9 @@ int vpn_ws_connect(vpn_ws_peer *peer, char *name) {
 	uint16_t key_len = vpn_ws_base64_encode(secret, 10, key);
 	// now build and send the request
 	char buf[8192];
-	int ret = snprintf(buf, 8192, "GET /%s HTTP/1.1\r\nHost: %s%s%s\r\n%sUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %.*s\r\nX-vpn-ws-MAC: %02x:%02x:%02x:%02x:%02x:%02x%s\r\n\r\n",
+	int ret = snprintf(buf, 8192, "GET /%s HTTP/1.1\r\nHost: %s\r\n%sUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %.*s\r\nX-vpn-ws-MAC: %02x:%02x:%02x:%02x:%02x:%02x%s\r\n\r\n",
 		path ? path : "",
-		domain,
-		port_str ? ":" : "",
-		port_str ? port_str+1 : "",
+		host_hdr,
 		auth ? auth : "",
 		key_len,
 		key,
@@ -338,9 +397,11 @@ int vpn_ws_connect(vpn_ws_peer *peer, char *name) {
 	);
 
 	if (auth) free(auth);
+	free(host_hdr);
 
 	if (ret == 0 || ret > 8192) {
 		vpn_ws_log("vpn_ws_connect()/snprintf()");
+		free(connect_host);
 		return -1;
 	}
 
@@ -362,10 +423,12 @@ int vpn_ws_connect(vpn_ws_peer *peer, char *name) {
 	int http_code = vpn_ws_wait_101(peer->fd, vpn_ws_conf.ssl_ctx);
 	if (http_code != 101) {
 		vpn_ws_warning("error, websocket handshake returned code: %d", http_code);
+		free(connect_host);
 		return -1;
 	}
 
-	vpn_ws_notice("connected to %s port %u (transport: %s)", domain, port, ssl ? "wss": "ws");
+	vpn_ws_notice("connected to %s port %u (transport: %s)", connect_host, port, ssl ? "wss": "ws");
+	free(connect_host);
 	return 0;
 }
 

@@ -1,379 +1,464 @@
-vpn-ws
-======
+# Lollipop (formerly vpn-ws)
 
-A VPN system over websockets
+Lollipop is a Layer-2 VPN over WebSocket (`ws://`) and secure WebSocket (`wss://`).
 
-This is the client/server implementation of a layer-2 software switch able to route packets over websockets connections.
+- **Server binary**: `vpn-ws`
+- **Client binary**: `vpn-ws-client`
+- **Desktop GUI wrapper**: `clients/lollipop_gui.py`
 
-The daemon is meant to be run behind nginx, apache, the uWSGI http router or a HTTP/HTTPS proxy able to speak the uwsgi protocol and to manage websockets connections
+This README is intentionally long and copy/paste-friendly.
 
-How it works
-============
+---
 
-A client creates a tap (ethernet-like) local device and connects to a websocket server (preferably over HTTPS). Once the websocket handshake is done,
-every packet received from the tuntap will be forwarded to the websocket server, and every websocket packet received from the server will be forwarded
-to the tuntap device.
+## 1) What you are building
 
-The server side of the stack can act as a simple switch (no access to the network, only connected nodes can communicate), a bridge (a tuntap device is created in
-the server itself that can forward packets to the main network stack) a simpe router/gateway (give access to each node to specific networks without allowing communication between nodes) or whatever
-you can think of. (The server is voluntary low-level to allow all the paradigms supported by the network stack).
+Lollipop creates a TAP interface and forwards Ethernet frames over WebSocket.
 
-Authentication/Authorization and Security
-=========================================
+- `ws://` mode = plain HTTP (debug only)
+- `wss://` mode = HTTPS + TLS encryption (normal usage)
+- Works behind nginx using `uwsgi_pass`
+- Authentication is handled by nginx (basic auth, mTLS, etc.)
 
-Authentication and Authorization is delegated to the proxy. We believe that battle-tested webservers (like nginx and apache) cover basically every authentication and security need, so there is no need to reimplement them.
+---
 
-By default only HTTPS access (eventually with client certificate authentication) should be allowed, but plain-http mode is permitted for easy debugging.
+## 2) Tested architecture for no-domain VPS
 
-Virtualhosting
-==============
+You said you have **no domain**, only VPS IP.
 
-A vpn-ws client is required to send the Host header during the handshake and "should" support SNI. In this way virtualhosting can be easily managed by the proxy server.
+This guide supports:
 
+- IPv4 only (`203.0.113.10`)
+- IPv6 only (`2001:db8::10`)
+- dual stack
 
-Installation from sources
-=========================
+We generate a **self-signed certificate with IP SAN** and then install/trust the cert on clients.
 
-note: see below for binary packages
+---
 
-You need gnu make and a c compiler (clang, gcc, and mingw-gcc are supported).
+## 3) Build from source (server and client)
 
-The server has no external dependancies, while the client requires openssl (except for OSX and Windows where their native ssl/tls implementation is used)
+### Ubuntu/Debian build deps
 
-Just run (remember to use 'gmake' on FreeBSD instead of 'make')
+```bash
+sudo apt update
+sudo apt install -y build-essential make gcc libssl-dev pkg-config
+```
 
-```sh
+### Build
+
+```bash
+git clone https://github.com/unbit/vpn-ws.git
+cd vpn-ws
+make clean
 make
 ```
 
-after having cloned the repository. If all goes well you will end with a binary named vpn-ws (the server) and another named vpn-ws-client (the client)
+Expected output binaries:
 
-You can eventually build server or client selectively with
-```sh
-make vpn-ws
-make vpn-ws-client
-```
+- `./vpn-ws`
+- `./vpn-ws-client`
 
-You can build a static binary version too of the server (where supported) with:
+Optional static server build:
 
-```sh
+```bash
+make clean
 make vpn-ws-static
 ```
-the resulting binary (vpn-ws) will have no library dependancies.
 
-Binary packages
-===============
+---
 
-updated to [20141121]
+## 4) Server setup on VPS (Ubuntu example)
 
-* linux x86_64 static server (https://github.com/unbit/vpn-ws/releases/download/v0.2/vpn-ws-0.2-linux-x86_64.tar.gz)
-* linux i386 static server (https://github.com/unbit/vpn-ws/releases/download/v0.2/vpn-ws-0.2-linux-i386.tar.gz)
-* linux raspberrypi (raspbian) (https://github.com/unbit/vpn-ws/releases/download/v0.2/vpn-ws-0.2-linux-armv6l.tar.gz)
-* freebsd x86_64 static server (https://github.com/unbit/vpn-ws/releases/download/v0.2/vpn-ws-0.2-freebsd-amd64.tar.gz)
-* osx universal binary client and server (https://github.com/unbit/vpn-ws/releases/download/v0.2/vpn-ws-0.2-osx.pkg)
-* windows client (https://github.com/unbit/vpn-ws/releases/download/v0.2/vpn-ws-client.exe)
+## 4.1 Install runtime packages
 
-
-Running the server
-==================
-
-by default the server binary takes a single argument, the name of the socket to bind (the one to which the proxy will connect to):
-
-```sh
-./vpn-ws /run/vpn.sock
+```bash
+sudo apt update
+sudo apt install -y nginx apache2-utils iproute2 bridge-utils ca-certificates openssl
 ```
 
-will bind to /run/vpn.sock
+## 4.2 Create directories
 
-Now you only need to configure your webserver/proxy to route requests to /run/vpn.sock using the uwsgi protocol (see below)
-
-Nginx
-=====
-
-Nginx will be your "shield", managing the authentication/authorization phase. HTTPS + basicauth is strongly suggested, but best setup would be HTTPS + certificates authentication. You can run with plain HTTP and without auth, but please, do not do it, unless for testing ;)
-
-You need to choose the location for which nginx will forward requests to the vpn-ws server:
-
-(we use /vpn)
-
-```nginx
-location /vpn {
-  include uwsgi_params;
-  uwsgi_pass unix:/run/vpn.sock;
-}
+```bash
+sudo mkdir -p /etc/lollipop /var/log/lollipop /run/lollipop
+sudo chown -R root:root /etc/lollipop
+sudo chmod 755 /etc/lollipop /var/log/lollipop
 ```
 
-this a setup without authentication, a better one (with basicauth) could be:
-```nginx
-location /vpn {
-  include uwsgi_params;
-  uwsgi_pass unix:/run/vpn.sock;
-  auth_basic "VPN";
-  auth_basic_user_file /etc/nginx/.htpasswd;
-}
+## 4.3 Create nginx basic auth credentials
+
+```bash
+sudo htpasswd -c /etc/nginx/.lollipop_htpasswd lollipop
+# enter a strong password when asked
 ```
 
-where /etc/nginx/.htpasswd will be the file containing credentials (you can use the htpasswd tool to generate them)
+## 4.4 Create a self-signed cert for IP address (NO DOMAIN)
 
-The Official Client
-===================
+> Replace IPs below with your real VPS IPs.
 
-The official client (vpn-ws-client) is a command line tool (written in C). Its syntax is pretty simple:
+```bash
+cat <<'EOF' | sudo tee /etc/lollipop/openssl-ip.cnf
+[req]
+default_bits = 4096
+prompt = no
+default_md = sha256
+x509_extensions = v3_req
+distinguished_name = dn
 
-```sh
-vpn-ws-client <tap> <server>
+[dn]
+C = US
+ST = VPS
+L = VPS
+O = Lollipop
+OU = VPN
+CN = 203.0.113.10
+
+[v3_req]
+subjectAltName = @alt_names
+extendedKeyUsage = serverAuth
+keyUsage = digitalSignature, keyEncipherment
+
+[alt_names]
+IP.1 = 203.0.113.10
+IP.2 = 2001:db8::10
+EOF
 ```
 
-where 'tap' is a (platform-dependent) tap device path, and 'server' is the url of the nginx /vpn path (in the ws://|wss:// form)
+Generate key + cert:
 
-Before using the client, you need to ensure you have some form of tun/tap implementation. Linux, FreeBSD and OpenBSD already have it out-of the box. 
-
-For OSX you need to install 
-
-http://sourceforge.net/projects/tuntaposx/files/tuntap/20141104
-
-while on Windows (ensure to select utils too, when running the installer)
-
-http://swupdate.openvpn.org/community/releases/tap-windows-9.9.2_3.exe
-
-The client must be run as root/sudo (as it requires to create a network interface [TODO: drop privileges after having created the interface).
-
-On linux (you can name devices as you want):
-
-```sh
-./vpn-ws-client vpn-ws0 wss://foo:bar@example.com/vpn
+```bash
+sudo openssl req -x509 -nodes -newkey rsa:4096 -days 825 \
+  -keyout /etc/lollipop/server.key \
+  -out /etc/lollipop/server.crt \
+  -config /etc/lollipop/openssl-ip.cnf
 ```
 
-On OSX (you have a fixed number of /dev/tapN devices you can use)
+Secure permissions:
 
-```sh
-./vpn-ws-client /dev/tap0 wss://foo:bar@example.com/vpn
+```bash
+sudo chmod 600 /etc/lollipop/server.key
+sudo chmod 644 /etc/lollipop/server.crt
 ```
 
-On FreeBSD (you need to create the interface to access the device):
+## 4.5 Start Lollipop server daemon (unix socket mode)
 
-```sh
-ifconfig tap0 create
-./vpn-ws-client /dev/tap0 wss://foo:bar@example.com/vpn
+```bash
+cd /opt
+sudo mkdir -p /opt/lollipop
+sudo cp /path/to/vpn-ws /opt/lollipop/vpn-ws
+sudo chmod 755 /opt/lollipop/vpn-ws
 ```
 
-On windows (you need to create a tap device via the provided utility and assign it a name, like 'foobar')
+Manual test run:
 
-```sh
-./vpn-ws-client foobar wss://foo:bar@example.com/vpn
+```bash
+sudo /opt/lollipop/vpn-ws /run/lollipop/vpn.sock
 ```
 
-Once your client is connected you can assign it an ip address (or make a dhcp request if one of the connected nodes has a running dhcp server)
+If you want server TAP too (optional):
 
-The mode we are using now is the simple "switch" one, where nodes simply communicates between them like in a lan.
-
-Server tap and Bridge mode
-==========================
-
-By default the server acts a simple switch, routing packets to connected peers based on the advertised mac address.
-
-In addition to this mode you can give the vpn-ws server a virtual device too (with its mac address) to build complex setup.
-
-To add a device to the vpn-ws server:
-
-```sh
-./vpn-ws --tuntap vpn0 /run/vpn.sock
+```bash
+sudo /opt/lollipop/vpn-ws --tuntap vpn0 /run/lollipop/vpn.sock
 ```
 
-the argument of tuntap is platform dependent (the same rules of clients apply).
+## 4.6 Configure nginx with BOTH ws(debug) and wss(normal)
 
-The 'vpn0' interface is considered like connected nodes, so once you give it an ip address it will join the switch.
+```bash
+cat <<'EOF' | sudo tee /etc/nginx/sites-available/lollipop.conf
+server {
+    listen 80;
+    listen [::]:80;
+    server_name _;
 
-One of the use case you may want to follow is briding the vpn with your physical network (in the server). For building it you need the server to forward packets without a matching connected peers to the tuntap device. This is the bridge mode. To enable it add --bridge to the server command line:
-
-```sh
-./vpn-ws --bridge --tuntap vpn0 /run/vpn.sock
-```
-
-Now you can add 'vpn0' to a pre-existing network bridge:
-
-```sh
-# linux example
-brctl addbr br0
-brctl addif br0 eth0
-brctl addif br0 vpn0
-```
-
-Client bridge-mode
-==================
-
-This mode allows a client to act as a bridge giving access to its whole network to the vpn (and it clients).
-
-Just add --bridge to the client command line and attach the tuntap device to a bridge.
-
-The main problem is that you still need a route to the vpn server, so the best approach would be having two network interfaces on the client (one for the connection with the server, and the other for the physical bridge).
-
-On linux, you can use the macvlan interface (it is basically a copy of a physical interface with a different mac address):
-
-```sh
-ip link add link eth0 name virt0 type macvlan
-ifconfig virt0 0.0.0.0 promisc up
-brctl addif br0 virt0
-# add vpn-ws tuntap device to the bridge
-ifconfig vpn17 0.0.0.0 promisc up
-brctl addif br0 vpn17
-```
-
-
-The --exec trick
-================
-
-Both the server and client take an optional argument named '--exec <cmd>'. This option will instruct the server/client to execute a command soon after the tuntap device is created.
-
-As an example you may want to call ifconfig upon connection:
-
-```sh
-vpn-ws-client --exec "ifconfig vpn17 192.168.173.17 netmask 255.255.255.0" vpn17 wss://example.com/
-```
-
-or to add your server to a tuntap to an already existent bridge:
-
-```sh
-vpn-ws --exec "brctl addif br0 vpn0" --bridge --tuntap vpn0 /run/vpn.sock
-```
-
-You can chain multiple commands with ;
-
-```sh
-vpn-ws --exec "brctl addif br0 vpn0; ifconfig br0 192.168.173.30" --bridge --tuntap vpn0 /run/vpn.sock
-```
-
-Required permissions
-====================
-
-The server, when no tuntap device is created, does not require specific permissions. If bound to a unix socket, it will give the 666 permission to the scket itself, in this way nginx (or whatever proxy you are using) will be able to connect to it.
-
-If the server needs to create a tap device, root permissions are required. By the way you can drop privileges soon after the device is created (and the --exec option is eventually executed) with the --uid ang --gid options:
-
-```sh
-vpn-ws --tuntap vpn0 --uid www-data --gid www-data /run/vpn.sock
-```
-
-The client instead requires privileged operations (future releases may allow dropping privileges in the client too)
-
-Client-certificate authentication
-=================================
-
-Your client can supply a certificate for authenticating to the server.
-
-On OpenSSL-based clients (Linux, FreeBSD) you need a key file and a certificate in pem format:
-
-```sh
-vpn-ws-client --key foobar.key --crt foobar.crt vpn0 wss://example.com/vpn
-```
-
-On OSX you need to import a .p12 file (or whatever format it support) to the login keychain, then you need to specify the name of the certificate/identity via the --crt option (no --key is involved):
-
-```sh
-vpn-ws-client --crt "My certificate" /dev/tap0 wss://example.com/vpn
-```
-
-
-The JSON Control interface
-==========================
-
-The uwsgi protocol supports a raw form of channel selections using 2 bytes of its header. Thos bytes are called "modifiers". By setting the modifier1 to '1' (by default modifiers are set to 0) you will tell the vpn-ws server to show the JSON control interface. This is a simple way for monitoring the server and for kicking out clients.
-
-When connectin to modifier1, a json blob with the data of all connected clients is shown. Passing a specific QUERY_STRING you can issue commands (currently only killing peers is implemented)
-
-```nginx
-location /vpn {
-  include uwsgi_params;
-  uwsgi_pass unix:/run/vpn.sock;
-  auth_basic "VPN";
-  auth_basic_user_file /etc/nginx/.htpasswd;
+    # Debug only (unencrypted)
+    location /vpn {
+        include uwsgi_params;
+        uwsgi_pass unix:/run/lollipop/vpn.sock;
+        auth_basic "Lollipop Debug";
+        auth_basic_user_file /etc/nginx/.lollipop_htpasswd;
+    }
 }
 
-location /vpn_admin {
-  include uwsgi_params;
-  uwsgi_modifier1 1;
-  uwsgi_pass unix:/run/vpn.sock;
-  auth_basic "VPN ADMIN";
-  auth_basic_user_file /etc/nginx/.htpasswd;
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name _;
+
+    ssl_certificate     /etc/lollipop/server.crt;
+    ssl_certificate_key /etc/lollipop/server.key;
+
+    # reasonable defaults
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+
+    # Normal encrypted endpoint
+    location /vpn {
+        include uwsgi_params;
+        uwsgi_pass unix:/run/lollipop/vpn.sock;
+        auth_basic "Lollipop VPN";
+        auth_basic_user_file /etc/nginx/.lollipop_htpasswd;
+    }
+
+    # Optional admin JSON API
+    location /vpn_admin {
+        include uwsgi_params;
+        uwsgi_modifier1 1;
+        uwsgi_pass unix:/run/lollipop/vpn.sock;
+        auth_basic "Lollipop Admin";
+        auth_basic_user_file /etc/nginx/.lollipop_htpasswd;
+    }
 }
+EOF
 ```
 
-You can now connect to /vpn_admin to see a json representation of connected clients. Each peer has an id. you can kick-out that peer/client adding a query string to the bar: 
+Enable site:
 
-/vpn_admin?kill=n
-
-where n is the id of the specific client.
-
-If needed, more commands could be added in the future.
-
-
-Example Clients
-===============
-
-In the clients/ directory there are a bunch of clients you can run on your nodes or you can use as a base for developing more advanced ones.
-
-Clients must run as root/sudo as they need to create/interact with tuntap devices
-
-* vpn_linux_tornado.py - a linux-only client based on tornado and ws4py
-
-```sh
-sudo pip install tornado ws4py python-pytun
-sudo python clients/vpn_linux_tornado.py ws://your_server/
+```bash
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo ln -sf /etc/nginx/sites-available/lollipop.conf /etc/nginx/sites-enabled/lollipop.conf
+sudo nginx -t
+sudo systemctl restart nginx
+sudo systemctl enable nginx
 ```
 
-* vpn.pl - more-or-less platform independent perl client (works with OSX and FreeBSD)
+---
 
-```sh
-sudo cpanm AnyEvent::WebSocket::Client
-sudo perl clients/vpn.pl /dev/tap0 ws://your_server/
+## 5) Add Lollipop server to systemd (autostart on reboot)
+
+```bash
+cat <<'EOF' | sudo tee /etc/systemd/system/lollipop.service
+[Unit]
+Description=Lollipop VPN WebSocket backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/lollipop/vpn-ws /run/lollipop/vpn.sock
+Restart=always
+RestartSec=2
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
 ```
 
-As the official client you need to ensure a tuntap device implementation is available on the system
+Enable + start:
 
-then (after having connected to the vpn server) you can assign the ip to it
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable lollipop.service
+sudo systemctl start lollipop.service
+sudo systemctl status lollipop.service --no-pager
+```
 
-Remember that we are at layer-2, so if you place a dhcp server on one of those nodes it will work as expected.
+---
 
+## 6) Export certificate from server and install on client
 
-Multicast and Broadcast
-=======================
+Copy server public cert to your local machine:
 
-They are both supported, (yes bonjour, mdns, samba will work !).
+```bash
+scp root@203.0.113.10:/etc/lollipop/server.crt ./lollipop-server.crt
+```
 
-You can eventually turn off them selectively adding
+(If only IPv6 reachable):
 
-* --no-broadcast
-* --no-multicast
+```bash
+scp root@[2001:db8::10]:/etc/lollipop/server.crt ./lollipop-server.crt
+```
 
-to the server command line
+### Linux trust store
 
-Tutorials
-=========
+```bash
+sudo cp ./lollipop-server.crt /usr/local/share/ca-certificates/lollipop-server.crt
+sudo update-ca-certificates
+```
 
-https://github.com/unbit/vpn-ws/blob/master/tutorials/ubuntu_trusty_nginx_bridge_client_certificates.md
+### macOS trust store
 
+```bash
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ./lollipop-server.crt
+```
 
-Support
-=======
+### Windows trust store (PowerShell as Admin)
 
-https://groups.google.com/d/forum/vpn-ws
+```powershell
+Import-Certificate -FilePath .\lollipop-server.crt -CertStoreLocation Cert:\LocalMachine\Root
+```
 
-(or drop a mail to info at unbit dot it for commercial support)
+### iOS trust store
 
-Twitter
-=======
+1. AirDrop/mail/file-share `lollipop-server.crt` to iPhone.
+2. Open file and install profile.
+3. Go to **Settings -> General -> About -> Certificate Trust Settings**.
+4. Enable full trust for your Lollipop certificate.
 
-(mainly for announces)
+---
 
-@unbit
+## 7) Client CLI usage (Linux/macOS/Windows)
 
-Status/TODO/Working on
-======================
+General syntax:
 
-The server on windows is still a work in progress
+```bash
+vpn-ws-client <tap_or_device> <ws_or_wss_url>
+```
 
-The client on windows has no support for SSL/TLS
+### 7.1 Linux client
 
-Grant support for NetBSD, and DragonflyBSD
+Create/open TAP by name automatically (run as root):
 
-Investigate solaris/smartos/omnios support
+```bash
+sudo ./vpn-ws-client vpn-ws0 wss://lollipop:YOUR_PASSWORD@203.0.113.10/vpn
+```
+
+IPv6 target:
+
+```bash
+sudo ./vpn-ws-client vpn-ws0 wss://lollipop:YOUR_PASSWORD@[2001:db8::10]/vpn
+```
+
+Assign IP to TAP after connect (example):
+
+```bash
+sudo ip addr add 10.99.0.2/24 dev vpn-ws0
+sudo ip link set vpn-ws0 up
+```
+
+### 7.2 macOS client
+
+Install TAP driver first (third-party tuntap package required), then:
+
+```bash
+sudo ./vpn-ws-client /dev/tap0 wss://lollipop:YOUR_PASSWORD@203.0.113.10/vpn
+```
+
+### 7.3 Windows client
+
+1. Install TAP-Windows adapter.
+2. Name adapter (example: `lollipop`).
+3. Run elevated shell:
+
+```powershell
+.\vpn-ws-client.exe lollipop wss://lollipop:YOUR_PASSWORD@203.0.113.10/vpn
+```
+
+---
+
+## 8) Desktop GUI app: Lollipop
+
+A simple PyQt GUI is included:
+
+- `clients/lollipop_gui.py`
+
+Install dependency:
+
+```bash
+python3 -m pip install PyQt5
+```
+
+Run:
+
+```bash
+python3 clients/lollipop_gui.py
+```
+
+In GUI:
+
+- Enter server IP (IPv4 or IPv6)
+- Enter username/password
+- Choose `wss` (recommended) or `ws` (debug)
+- Click **Connect**
+
+The GUI wraps `vpn-ws-client`, so TAP support is still required.
+
+---
+
+## 9) iOS support (important technical reality)
+
+iOS does not allow arbitrary user apps to create TAP interfaces and full Layer-2 tunnels unless the app has Apple Network Extension entitlements.
+
+So for iOS:
+
+- You can install/trust certs (covered above)
+- You can connect at app level with custom software
+- But full system-wide Layer-2 VPN requires Apple-approved entitlements and an iOS app built around `NetworkExtension`
+
+This repository now provides complete server + desktop client flow. For iOS production-grade tunnel app, you must build/sign a dedicated NetworkExtension app with Apple entitlement approval.
+
+---
+
+## 10) Debug flow vs production flow
+
+### Debug (`ws://`)
+
+```bash
+sudo ./vpn-ws-client vpn-ws0 ws://lollipop:YOUR_PASSWORD@203.0.113.10/vpn
+```
+
+### Production (`wss://`)
+
+```bash
+sudo ./vpn-ws-client vpn-ws0 wss://lollipop:YOUR_PASSWORD@203.0.113.10/vpn
+```
+
+Always prefer `wss://` in normal use.
+
+---
+
+## 11) Optional bridge mode examples
+
+Server bridge mode:
+
+```bash
+sudo /opt/lollipop/vpn-ws --bridge --tuntap vpn0 /run/lollipop/vpn.sock
+```
+
+Client bridge mode:
+
+```bash
+sudo ./vpn-ws-client --bridge vpn-ws0 wss://lollipop:YOUR_PASSWORD@203.0.113.10/vpn
+```
+
+---
+
+## 12) Useful operations
+
+Check logs:
+
+```bash
+sudo journalctl -u lollipop.service -f
+sudo journalctl -u nginx -f
+```
+
+Validate port listeners:
+
+```bash
+sudo ss -tulpen | grep -E ':80|:443'
+```
+
+Check nginx config:
+
+```bash
+sudo nginx -t
+```
+
+---
+
+## 13) Security checklist
+
+- Use `wss://` in production
+- Keep `/etc/lollipop/server.key` mode `600`
+- Use strong nginx basic auth password
+- Keep server patched
+- Install/trust certificate explicitly on clients
+- Do not use `--no-verify` in client
+
+---
+
+## 14) Changed naming
+
+User-facing name is now **Lollipop**.
+
+Binary names remain `vpn-ws` and `vpn-ws-client` for compatibility.
