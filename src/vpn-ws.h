@@ -118,6 +118,8 @@ struct vpn_ws_config {
 
 	char *ssl_key;
 	char *ssl_crt;
+	char *basic_auth_user;
+	char *basic_auth_password;
 
 	int no_multicast;
 	int no_broadcast;
