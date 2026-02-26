@@ -15,7 +15,12 @@ struct ContentView: View {
                     TextField("Path", text: $vpnManager.path)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                    Toggle("Use TLS (wss)", isOn: $vpnManager.useTLS)
+
+                    Picker("Protocol", selection: $vpnManager.protocolMode) {
+                        Text("wss").tag("wss")
+                        Text("https2").tag("https2")
+                    }
+                    .pickerStyle(.segmented)
                 }
 
                 Section("Authentication") {

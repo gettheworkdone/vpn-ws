@@ -1,31 +1,30 @@
 # Lollipop transport toolkit
 
-Lollipop provides two transports:
+Lollipop now exposes two transport modes:
 
-1. **WebSocket over TLS (`wss://`)** using `vpn-ws` / `vpn-ws-client` (full L2 tunnel).
-2. **HTTPS/HTTP2 request-response payload tunnel** (experimental) using `server_h2/h2_tunnel_server.py` + `clients/h2_tunnel_client.py`.
+1. **WSS mode** (`wss://`) for persistent websocket Layer-2 tunneling (`vpn-ws` + `vpn-ws-client`).
+2. **HTTPS2 mode** (`https://...` request/response) for payload tunneling without persistent websocket sessions.
 
-Server remains command-line software, now packaged in Docker.
+Both modes are available in desktop GUI and iOS client switchers.
 
 ---
 
-## Build native binaries
+## 1) Build
 
 ```bash
 make clean
 make
 ```
 
-Produces:
-
+Binaries:
 - `./vpn-ws`
 - `./vpn-ws-client`
 
 ---
 
-## Client headers are fully configurable
+## 2) Configurable request headers
 
-`vpn-ws-client` now supports repeated `--header` options, so request headers can look browser-like and be tuned later:
+Native client supports repeatable browser-like header overrides:
 
 ```bash
 sudo ./vpn-ws-client \
@@ -34,42 +33,37 @@ sudo ./vpn-ws-client \
   --header "User-Agent: Mozilla/5.0" \
   --header "Accept-Language: en-US,en;q=0.9" \
   --header "Cache-Control: no-cache" \
-  vpn-ws0 \
-  wss://203.0.113.10/cucumber
+  vpn-ws0 wss://127.0.0.1/cucumber
 ```
 
-Also supported:
-
-- `--user <name>`
-- `--password <secret>`
+Options:
+- `--user`
+- `--password`
+- `--header "Name: Value"` (max 32)
 
 ---
 
-## Docker server (recommended)
+## 3) Docker server (nginx + vpn-ws + https2 payload service)
 
-This runs nginx + `vpn-ws` + experimental HTTPS payload service in one container.
-
-### 1) Build image
+### Build image
 
 ```bash
 docker build -t lollipop-server -f docker/Dockerfile .
 ```
 
-### 2) Run container
+### Run
 
 ```bash
 docker run -d \
   --name lollipop-server \
   -p 80:80 -p 443:443 \
-  -e SERVER_IPV4=203.0.113.10 \
-  -e SERVER_IPV6=2001:db8::10 \
+  -e SERVER_IPV4=127.0.0.1 \
+  -e SERVER_IPV6=::1 \
   -v lollipop-certs:/data/certs \
   lollipop-server
 ```
 
-### 3) Certificate location (copy for clients)
-
-Inside container / mounted volume:
+### Generated cert paths
 
 - cert: `/data/certs/cucumber.crt`
 - key: `/data/certs/potato.key`
@@ -80,62 +74,82 @@ Copy cert to host:
 docker cp lollipop-server:/data/certs/cucumber.crt ./cucumber.crt
 ```
 
-Then trust/install this cert on your clients.
-
-> Certificate subject and auth words intentionally avoid VPN naming and use simple words (`cucumber`, `potato`).
+No VPN words are used in generated certificate naming.
 
 ---
 
-## WSS mode (full L2 tunnel)
+## 4) Localhost test on Linux (required smoke test)
 
-Run client:
+This verifies the new HTTPS2 mode end-to-end on localhost.
+
+### Start experimental payload server locally
 
 ```bash
-sudo ./vpn-ws-client --user cucumber --password potato vpn-ws0 wss://203.0.113.10/cucumber
+python3 server_h2/h2_tunnel_server.py
+```
+
+In a second terminal:
+
+```bash
+python3 clients/h2_tunnel_client.py --base http://127.0.0.1:18080 --client-id test1 --send "hello-local"
+python3 clients/h2_tunnel_client.py --base http://127.0.0.1:18080 --client-id test1 --recv
+```
+
+Expected: second command prints `hello-local`.
+
+---
+
+## 5) uTLS client for browser-like TLS fingerprint
+
+If you want browser-like TLS handshake fingerprinting, use included Go uTLS client:
+
+- source: `clients/utls/main.go`
+- module: `clients/utls/go.mod`
+
+Run:
+
+```bash
+cd clients/utls
+go mod tidy
+go run . --base https://127.0.0.1/potato_h2 --client-id test1 --send "hello"
+go run . --base https://127.0.0.1/potato_h2 --client-id test1 --recv
+```
+
+This uses `utls.HelloChrome_Auto` for TLS handshake shaping.
+
+---
+
+## 6) WSS mode usage
+
+```bash
+sudo ./vpn-ws-client --user cucumber --password potato vpn-ws0 wss://127.0.0.1/cucumber
 ```
 
 IPv6:
 
 ```bash
-sudo ./vpn-ws-client --user cucumber --password potato vpn-ws0 wss://[2001:db8::10]/cucumber
+sudo ./vpn-ws-client --user cucumber --password potato vpn-ws0 wss://[::1]/cucumber
 ```
 
 ---
 
-## HTTPS/HTTP2 mode (request-response payload, experimental)
+## 7) HTTPS2 mode usage
 
-This is not the websocket L2 tunnel. It is HTTP payload exchange over TLS.
-
-### Server endpoint paths
-
+Paths served by nginx in docker stack:
 - `POST /potato_h2/send`
 - `GET /potato_h2/recv`
 
-These are exposed through nginx TLS listener (`listen 443 ssl http2;`).
-
-### Client usage
-
-Install dependency:
-
-```bash
-python3 -m pip install requests
-```
-
-Send payload:
+CLI example:
 
 ```bash
 python3 clients/h2_tunnel_client.py \
-  --base https://203.0.113.10/potato_h2 \
+  --base https://127.0.0.1/potato_h2 \
   --client-id node1 \
   --cafile ./cucumber.crt \
   --send "hello-from-client"
-```
 
-Receive payload:
-
-```bash
 python3 clients/h2_tunnel_client.py \
-  --base https://203.0.113.10/potato_h2 \
+  --base https://127.0.0.1/potato_h2 \
   --client-id node1 \
   --cafile ./cucumber.crt \
   --recv
@@ -143,8 +157,29 @@ python3 clients/h2_tunnel_client.py \
 
 ---
 
-## Notes
+## 8) Client protocol switchers (all platforms)
 
-- `wss://` mode = persistent websocket tunnel, best for full VPN-like behavior.
-- HTTPS/HTTP2 mode = request-response transport, useful when you need plain HTTPS-like traffic patterns.
-- You can tune headers with `--header` and adjust nginx paths/words as needed.
+### Linux / macOS / Windows
+
+Use `clients/lollipop_gui.py` (launchers in `clients/linux`, `clients/macos`, `clients/windows`).
+
+GUI protocol selector now includes:
+- `ws`
+- `wss`
+- `https2`
+
+### iOS
+
+`clients/ios/LollipopApp/ContentView.swift` includes protocol segmented selector:
+- `wss`
+- `https2`
+
+Tunnel provider in `clients/ios/LollipopTunnel/PacketTunnelProvider.swift` handles both branches.
+
+---
+
+## 9) Notes
+
+- WSS mode is still the correct choice for full L2 vpn-ws behavior.
+- HTTPS2 mode is experimental request/response payload transport.
+- You can tune handshake/request headers with `--header` and your own nginx rules.

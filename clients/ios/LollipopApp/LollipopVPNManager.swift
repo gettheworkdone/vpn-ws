@@ -6,14 +6,14 @@ final class LollipopVPNManager: ObservableObject {
 
     @Published var serverIP = "203.0.113.10"
     @Published var port = "443"
-    @Published var path = "vpn"
-    @Published var username = "lollipop"
-    @Published var password = ""
-    @Published var useTLS = true
+    @Published var path = "cucumber"
+    @Published var username = "cucumber"
+    @Published var password = "potato"
+    @Published var protocolMode = "wss"
     @Published var statusMessage = "Idle"
     @Published var isConnected = false
 
-    private let manager = NETunnelProviderManager()
+    private var manager: NETunnelProviderManager?
 
     private init() {
         loadProfile()
@@ -28,41 +28,36 @@ final class LollipopVPNManager: ObservableObject {
                 }
 
                 if let saved = managers?.first {
-                    self?.applyManager(saved)
+                    self?.manager = saved
                     self?.statusMessage = "Profile loaded"
+                    self?.isConnected = saved.connection.status == .connected || saved.connection.status == .connecting
                 } else {
+                    self?.manager = NETunnelProviderManager()
                     self?.statusMessage = "No saved profile"
                 }
             }
         }
     }
 
-    private func applyManager(_ saved: NETunnelProviderManager) {
-        manager.localizedDescription = saved.localizedDescription
-        manager.protocolConfiguration = saved.protocolConfiguration
-        manager.isEnabled = saved.isEnabled
-        manager.onDemandRules = saved.onDemandRules
-        manager.isOnDemandEnabled = saved.isOnDemandEnabled
-        if let session = manager.connection as? NETunnelProviderSession {
-            isConnected = session.status == .connected || session.status == .connecting
-        }
-    }
-
     func saveProfile() {
+        guard let manager else {
+            statusMessage = "Manager unavailable"
+            return
+        }
+
         let proto = NETunnelProviderProtocol()
         proto.providerBundleIdentifier = "com.example.Lollipop.LollipopTunnel"
         proto.serverAddress = serverIP
         proto.username = username
 
-        var config: [String: NSObject] = [
+        proto.providerConfiguration = [
             "serverIP": serverIP as NSString,
             "port": port as NSString,
             "path": path as NSString,
             "username": username as NSString,
             "password": password as NSString,
-            "scheme": (useTLS ? "wss" : "ws") as NSString,
+            "scheme": protocolMode as NSString,
         ]
-        proto.providerConfiguration = config
 
         manager.localizedDescription = "Lollipop"
         manager.protocolConfiguration = proto
@@ -80,7 +75,7 @@ final class LollipopVPNManager: ObservableObject {
     }
 
     func toggleConnection() {
-        guard let session = manager.connection as? NETunnelProviderSession else {
+        guard let manager, let session = manager.connection as? NETunnelProviderSession else {
             statusMessage = "Invalid tunnel session"
             return
         }
