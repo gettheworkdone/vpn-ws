@@ -13,6 +13,7 @@ static struct option vpn_ws_options[] = {
         {"crt", required_argument, NULL, 3 },
         {"user", required_argument, NULL, 4 },
         {"password", required_argument, NULL, 5 },
+        {"header", required_argument, NULL, 6 },
         {"no-verify", no_argument, &vpn_ws_conf.ssl_no_verify, 1 },
 	{"bridge", no_argument, &vpn_ws_conf.bridge, 1 },
         {NULL, 0, 0, 0}
@@ -404,8 +405,8 @@ int vpn_ws_connect(vpn_ws_peer *peer, char *name) {
 #endif
 	uint16_t key_len = vpn_ws_base64_encode(secret, 10, key);
 	// now build and send the request
-	char buf[8192];
-	int ret = snprintf(buf, 8192, "GET /%s HTTP/1.1\r\nHost: %s\r\n%sUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %.*s\r\nX-vpn-ws-MAC: %02x:%02x:%02x:%02x:%02x:%02x%s\r\n\r\n",
+	char buf[16384];
+	int ret = snprintf(buf, sizeof(buf), "GET /%s HTTP/1.1\r\nHost: %s\r\n%sUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %.*s\r\nX-vpn-ws-MAC: %02x:%02x:%02x:%02x:%02x:%02x%s\r\n",
 		path ? path : "",
 		host_hdr,
 		auth ? auth : "",
@@ -420,10 +421,34 @@ int vpn_ws_connect(vpn_ws_peer *peer, char *name) {
 		vpn_ws_conf.bridge ? "\r\nX-vpn-ws-bridge: on" : ""
 	);
 
+	if (ret > 0) {
+		uint8_t i;
+		for(i=0;i<vpn_ws_conf.extra_headers_n;i++) {
+			char *eh = vpn_ws_conf.extra_headers[i];
+			if (!eh) continue;
+			int hdr_len = snprintf(buf + ret, sizeof(buf) - ret, "%s\r\n", eh);
+			if (hdr_len <= 0 || hdr_len >= (int) (sizeof(buf) - ret)) {
+				ret = -1;
+				break;
+			}
+			ret += hdr_len;
+		}
+	}
+
+	if (ret > 0) {
+		int end_len = snprintf(buf + ret, sizeof(buf) - ret, "\r\n");
+		if (end_len <= 0 || end_len >= (int) (sizeof(buf) - ret)) {
+			ret = -1;
+		}
+		else {
+			ret += end_len;
+		}
+	}
+
 	if (auth) free(auth);
 	free(host_hdr);
 
-	if (ret == 0 || ret > 8192) {
+	if (ret <= 0 || ret > sizeof(buf)) {
 		vpn_ws_log("vpn_ws_connect()/snprintf()");
 		free(connect_host);
 		return -1;
@@ -493,6 +518,13 @@ int main(int argc, char *argv[]) {
                                 break;
                         case 5:
                                 vpn_ws_conf.basic_auth_password = optarg;
+                                break;
+                        case 6:
+                                if (vpn_ws_conf.extra_headers_n >= 32) {
+                                        vpn_ws_warning("too many --header options (max 32)");
+                                        vpn_ws_exit(1);
+                                }
+                                vpn_ws_conf.extra_headers[vpn_ws_conf.extra_headers_n++] = optarg;
                                 break;
                         case '?':
                                 break;

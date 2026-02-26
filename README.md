@@ -1,395 +1,150 @@
-# Lollipop (vpn-ws)
+# Lollipop transport toolkit
 
-Lollipop is a Layer-2 VPN over WebSocket.
+Lollipop provides two transports:
 
-- Server binary: `vpn-ws` (CLI only)
-- Client binary: `vpn-ws-client` (CLI)
-- GUI wrappers/source are in `clients/`
+1. **WebSocket over TLS (`wss://`)** using `vpn-ws` / `vpn-ws-client` (full L2 tunnel).
+2. **HTTPS/HTTP2 request-response payload tunnel** (experimental) using `server_h2/h2_tunnel_server.py` + `clients/h2_tunnel_client.py`.
 
-This guide is written as copy/paste instructions for IP-only VPS deployment (no domain), with both debug `ws://` and production `wss://` modes.
-
----
-
-## 1. Repository layout and clients
-
-- `src/` – C implementation of server/client
-- `clients/lollipop_gui.py` – desktop GUI wrapper (uses `vpn-ws-client`)
-- `clients/linux/lollipop.sh` – Linux launcher for GUI
-- `clients/macos/lollipop.command` – macOS launcher for GUI
-- `clients/windows/lollipop.bat` – Windows launcher for GUI
-- `clients/ios/` – iOS SwiftUI app + Packet Tunnel extension source (NetworkExtension)
-
-> Server side remains CLI only by design.
+Server remains command-line software, now packaged in Docker.
 
 ---
 
-## 2. Build binaries from source (Linux/macOS)
+## Build native binaries
 
 ```bash
-sudo apt update
-sudo apt install -y build-essential make gcc libssl-dev pkg-config
-
-git clone https://github.com/unbit/vpn-ws.git
-cd vpn-ws
 make clean
 make
 ```
 
-Expected:
+Produces:
 
 - `./vpn-ws`
 - `./vpn-ws-client`
 
 ---
 
-## 3. VPS server setup (nginx + systemd + TLS cert with IP SAN)
+## Client headers are fully configurable
 
-## 3.1 Install packages
+`vpn-ws-client` now supports repeated `--header` options, so request headers can look browser-like and be tuned later:
 
 ```bash
-sudo apt update
-sudo apt install -y nginx apache2-utils iproute2 bridge-utils ca-certificates openssl
+sudo ./vpn-ws-client \
+  --user cucumber \
+  --password potato \
+  --header "User-Agent: Mozilla/5.0" \
+  --header "Accept-Language: en-US,en;q=0.9" \
+  --header "Cache-Control: no-cache" \
+  vpn-ws0 \
+  wss://203.0.113.10/cucumber
 ```
 
-## 3.2 Prepare folders
+Also supported:
+
+- `--user <name>`
+- `--password <secret>`
+
+---
+
+## Docker server (recommended)
+
+This runs nginx + `vpn-ws` + experimental HTTPS payload service in one container.
+
+### 1) Build image
 
 ```bash
-sudo mkdir -p /etc/lollipop /opt/lollipop /run/lollipop
-sudo cp ./vpn-ws /opt/lollipop/vpn-ws
-sudo chmod 755 /opt/lollipop/vpn-ws
+docker build -t lollipop-server -f docker/Dockerfile .
 ```
 
-## 3.3 Create nginx auth credentials
+### 2) Run container
 
 ```bash
-sudo htpasswd -c /etc/nginx/.lollipop_htpasswd lollipop
+docker run -d \
+  --name lollipop-server \
+  -p 80:80 -p 443:443 \
+  -e SERVER_IPV4=203.0.113.10 \
+  -e SERVER_IPV6=2001:db8::10 \
+  -v lollipop-certs:/data/certs \
+  lollipop-server
 ```
 
-## 3.4 Generate self-signed cert for IP (no domain)
+### 3) Certificate location (copy for clients)
 
-Edit IPs to your real server IPs:
+Inside container / mounted volume:
+
+- cert: `/data/certs/cucumber.crt`
+- key: `/data/certs/potato.key`
+
+Copy cert to host:
 
 ```bash
-cat <<'EOF' | sudo tee /etc/lollipop/openssl-ip.cnf
-[req]
-default_bits = 4096
-prompt = no
-default_md = sha256
-x509_extensions = v3_req
-distinguished_name = dn
-
-[dn]
-C = US
-ST = VPS
-L = VPS
-O = Lollipop
-OU = VPN
-CN = 203.0.113.10
-
-[v3_req]
-subjectAltName = @alt_names
-extendedKeyUsage = serverAuth
-keyUsage = digitalSignature, keyEncipherment
-
-[alt_names]
-IP.1 = 203.0.113.10
-IP.2 = 2001:db8::10
-EOF
-
-sudo openssl req -x509 -nodes -newkey rsa:4096 -days 825 \
-  -keyout /etc/lollipop/server.key \
-  -out /etc/lollipop/server.crt \
-  -config /etc/lollipop/openssl-ip.cnf
-
-sudo chmod 600 /etc/lollipop/server.key
-sudo chmod 644 /etc/lollipop/server.crt
+docker cp lollipop-server:/data/certs/cucumber.crt ./cucumber.crt
 ```
 
-## 3.5 Run backend manually once (test)
+Then trust/install this cert on your clients.
+
+> Certificate subject and auth words intentionally avoid VPN naming and use simple words (`cucumber`, `potato`).
+
+---
+
+## WSS mode (full L2 tunnel)
+
+Run client:
 
 ```bash
-sudo /opt/lollipop/vpn-ws /run/lollipop/vpn.sock
+sudo ./vpn-ws-client --user cucumber --password potato vpn-ws0 wss://203.0.113.10/cucumber
 ```
 
-## 3.6 Configure nginx with BOTH ws (debug) and wss (normal)
+IPv6:
 
 ```bash
-cat <<'EOF' | sudo tee /etc/nginx/sites-available/lollipop.conf
-server {
-    listen 80;
-    listen [::]:80;
-    server_name _;
-
-    # Debug endpoint (plaintext HTTP/websocket)
-    location /vpn {
-        include uwsgi_params;
-        uwsgi_pass unix:/run/lollipop/vpn.sock;
-        auth_basic "Lollipop Debug";
-        auth_basic_user_file /etc/nginx/.lollipop_htpasswd;
-    }
-}
-
-server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
-    server_name _;
-
-    ssl_certificate /etc/lollipop/server.crt;
-    ssl_certificate_key /etc/lollipop/server.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-
-    # Production encrypted endpoint
-    location /vpn {
-        include uwsgi_params;
-        uwsgi_pass unix:/run/lollipop/vpn.sock;
-        auth_basic "Lollipop VPN";
-        auth_basic_user_file /etc/nginx/.lollipop_htpasswd;
-    }
-
-    location /vpn_admin {
-        include uwsgi_params;
-        uwsgi_modifier1 1;
-        uwsgi_pass unix:/run/lollipop/vpn.sock;
-        auth_basic "Lollipop Admin";
-        auth_basic_user_file /etc/nginx/.lollipop_htpasswd;
-    }
-}
-EOF
-
-sudo rm -f /etc/nginx/sites-enabled/default
-sudo ln -sf /etc/nginx/sites-available/lollipop.conf /etc/nginx/sites-enabled/lollipop.conf
-sudo nginx -t
-sudo systemctl restart nginx
-sudo systemctl enable nginx
-```
-
-## 3.7 Add backend to systemd (autostart)
-
-```bash
-cat <<'EOF' | sudo tee /etc/systemd/system/lollipop.service
-[Unit]
-Description=Lollipop VPN websocket backend
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/opt/lollipop/vpn-ws /run/lollipop/vpn.sock
-Restart=always
-RestartSec=2
-User=root
-Group=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable lollipop.service
-sudo systemctl start lollipop.service
-sudo systemctl status lollipop.service --no-pager
+sudo ./vpn-ws-client --user cucumber --password potato vpn-ws0 wss://[2001:db8::10]/cucumber
 ```
 
 ---
 
-## 4. Certificate distribution and trust
+## HTTPS/HTTP2 mode (request-response payload, experimental)
 
-Download server cert to each client machine:
+This is not the websocket L2 tunnel. It is HTTP payload exchange over TLS.
 
-```bash
-scp root@203.0.113.10:/etc/lollipop/server.crt ./lollipop-server.crt
-# or
-scp root@[2001:db8::10]:/etc/lollipop/server.crt ./lollipop-server.crt
-```
+### Server endpoint paths
 
-Trust it system-wide:
+- `POST /potato_h2/send`
+- `GET /potato_h2/recv`
 
-### Linux
+These are exposed through nginx TLS listener (`listen 443 ssl http2;`).
 
-```bash
-sudo cp ./lollipop-server.crt /usr/local/share/ca-certificates/lollipop-server.crt
-sudo update-ca-certificates
-```
+### Client usage
 
-### macOS
+Install dependency:
 
 ```bash
-sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ./lollipop-server.crt
+python3 -m pip install requests
 ```
 
-### Windows (PowerShell as Administrator)
-
-```powershell
-Import-Certificate -FilePath .\lollipop-server.crt -CertStoreLocation Cert:\LocalMachine\Root
-```
-
-### iOS
-
-1. Copy `lollipop-server.crt` to device.
-2. Install profile.
-3. Enable trust in **Settings → General → About → Certificate Trust Settings**.
-
----
-
-## 5. CLI client usage and command explanation
-
-Base syntax:
+Send payload:
 
 ```bash
-vpn-ws-client [OPTIONS] <tap_or_device> <ws_url>
+python3 clients/h2_tunnel_client.py \
+  --base https://203.0.113.10/potato_h2 \
+  --client-id node1 \
+  --cafile ./cucumber.crt \
+  --send "hello-from-client"
 ```
 
-### Example command
+Receive payload:
 
 ```bash
-sudo ./vpn-ws-client vpn-ws0 wss://lollipop:YOUR_PASSWORD@203.0.113.10/vpn
-```
-
-Meaning:
-
-- `sudo` – needed to create/manage TAP interface
-- `vpn-ws0` – local TAP interface name
-- `wss://` – encrypted websocket over TLS
-- `lollipop:YOUR_PASSWORD@` – HTTP BasicAuth credentials (`username:password`)
-- `203.0.113.10` – VPS IP
-- `/vpn` – nginx location forwarded to backend
-
-### Is password sent in GET query string?
-
-No. It is **not** in query args and not in `GET /...?password=...`.
-
-- Credentials are converted to `Authorization: Basic <base64>` header.
-- With `wss://`, the full HTTP handshake headers (including Authorization) are inside TLS encryption on the wire.
-- So passive network observers cannot read it.
-
-### Safer credential style (new)
-
-You can now avoid credentials in URL and pass them as options:
-
-```bash
-sudo ./vpn-ws-client --user lollipop --password 'YOUR_PASSWORD' vpn-ws0 wss://203.0.113.10/vpn
-```
-
-IPv6 example:
-
-```bash
-sudo ./vpn-ws-client --user lollipop --password 'YOUR_PASSWORD' vpn-ws0 wss://[2001:db8::10]/vpn
+python3 clients/h2_tunnel_client.py \
+  --base https://203.0.113.10/potato_h2 \
+  --client-id node1 \
+  --cafile ./cucumber.crt \
+  --recv
 ```
 
 ---
 
-## 6. What is bridge mode?
+## Notes
 
-Lollipop works at Ethernet (Layer 2). By default, server/client act like virtual switch ports.
-
-### Normal mode (no bridge)
-
-- Only VPN members exchange frames through the vpn-ws switch.
-- Local physical LAN is separate.
-
-### Bridge mode
-
-Bridge mode connects the VPN TAP interface to an existing OS bridge (`br0`), effectively extending one broadcast domain.
-
-Use cases:
-- expose a full LAN segment to remote peers
-- allow L2 protocols (ARP, mDNS, SMB browsing) across sites
-
-Tradeoffs:
-- more broadcast traffic
-- easier to create loops/misconfiguration
-- should be used only when you need true L2 extension
-
-Server bridge mode example:
-
-```bash
-sudo /opt/lollipop/vpn-ws --bridge --tuntap vpn0 /run/lollipop/vpn.sock
-```
-
-Client bridge mode example:
-
-```bash
-sudo ./vpn-ws-client --bridge vpn-ws0 wss://203.0.113.10/vpn
-```
-
----
-
-## 7. Desktop GUI clients (Linux/macOS/Windows)
-
-Install PyQt5:
-
-```bash
-python3 -m pip install PyQt5
-```
-
-Run per platform:
-
-### Linux
-
-```bash
-./clients/linux/lollipop.sh
-```
-
-### macOS
-
-```bash
-./clients/macos/lollipop.command
-```
-
-### Windows
-
-```bat
-clients\windows\lollipop.bat
-```
-
-GUI fields:
-- server IP (v4/v6)
-- port/path
-- username/password
-- protocol ws/wss
-- optional client cert argument (`--crt`)
-
----
-
-## 8. iOS client (NetworkExtension) source
-
-You asked for iOS app support. Source is included in `clients/ios`:
-
-- `clients/ios/LollipopApp/*`
-- `clients/ios/LollipopTunnel/*`
-- `clients/ios/README.md` build instructions
-
-This uses `NetworkExtension` Packet Tunnel scaffolding and websocket auth wiring compatible with your Apple developer entitlement workflow.
-
-> Build/signing must be done in Xcode on macOS with your Apple team profile.
-
----
-
-## 9. Debug vs production endpoints
-
-Debug only (plaintext):
-
-```bash
-sudo ./vpn-ws-client --user lollipop --password 'YOUR_PASSWORD' vpn-ws0 ws://203.0.113.10/vpn
-```
-
-Production (encrypted):
-
-```bash
-sudo ./vpn-ws-client --user lollipop --password 'YOUR_PASSWORD' vpn-ws0 wss://203.0.113.10/vpn
-```
-
-Always use `wss://` for normal usage.
-
----
-
-## 10. Health checks
-
-```bash
-sudo nginx -t
-sudo systemctl status lollipop.service --no-pager
-sudo systemctl status nginx --no-pager
-sudo ss -tulpen | grep -E ':80|:443'
-sudo journalctl -u lollipop.service -f
-```
+- `wss://` mode = persistent websocket tunnel, best for full VPN-like behavior.
+- HTTPS/HTTP2 mode = request-response transport, useful when you need plain HTTPS-like traffic patterns.
+- You can tune headers with `--header` and adjust nginx paths/words as needed.
