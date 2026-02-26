@@ -11,6 +11,9 @@ static struct option vpn_ws_options[] = {
         {"exec", required_argument, NULL, 1 },
         {"key", required_argument, NULL, 2 },
         {"crt", required_argument, NULL, 3 },
+        {"user", required_argument, NULL, 4 },
+        {"password", required_argument, NULL, 5 },
+        {"header", required_argument, NULL, 6 },
         {"no-verify", no_argument, &vpn_ws_conf.ssl_no_verify, 1 },
 	{"bridge", no_argument, &vpn_ws_conf.bridge, 1 },
         {NULL, 0, 0, 0}
@@ -210,6 +213,7 @@ int vpn_ws_client_write(vpn_ws_peer *peer, uint8_t *buf, uint64_t len) {
 
 int vpn_ws_connect(vpn_ws_peer *peer, char *name) {
 	static char *cpy = NULL;
+	static char *raw_userinfo = NULL;
 	char *host_hdr = NULL;
 	char *connect_host = NULL;
 
@@ -248,12 +252,16 @@ int vpn_ws_connect(vpn_ws_peer *peer, char *name) {
 		path = slash + 1;
 	}
 
-	// check for basic auth
+	// check for basic auth in url (userinfo)
 	char *at = strchr(domain, '@');
 	if (at) {
 		*at = 0;
 		domain = at+1;
 		domain_len = strlen(domain);
+		raw_userinfo = cpy + 5 + ssl;
+	}
+	else {
+		raw_userinfo = NULL;
 	}
 
 	// parse host and optional port, with support for [ipv6]:port
@@ -357,16 +365,33 @@ int vpn_ws_connect(vpn_ws_peer *peer, char *name) {
 	}
 
 	char *auth = NULL;
+	char *auth_src = NULL;
 
-	if (at) {
-		char *crd = cpy + 5 + ssl;
-		auth = vpn_ws_calloc(23 + (strlen(crd) * 2));
+	if (vpn_ws_conf.basic_auth_user) {
+		size_t user_len = strlen(vpn_ws_conf.basic_auth_user);
+		size_t pass_len = vpn_ws_conf.basic_auth_password ? strlen(vpn_ws_conf.basic_auth_password) : 0;
+		auth_src = vpn_ws_calloc(user_len + 1 + pass_len + 1);
+		if (!auth_src) {
+			free(connect_host);
+			return -1;
+		}
+		snprintf(auth_src, user_len + 1 + pass_len + 1, "%s:%s", vpn_ws_conf.basic_auth_user, vpn_ws_conf.basic_auth_password ? vpn_ws_conf.basic_auth_password : "");
+	}
+	else if (raw_userinfo) {
+		auth_src = raw_userinfo;
+	}
+
+	if (auth_src) {
+		auth = vpn_ws_calloc(23 + (strlen(auth_src) * 2));
 		if (!auth) {
+			if (vpn_ws_conf.basic_auth_user) free(auth_src);
+			free(connect_host);
 			return -1;
 		}
 		memcpy(auth, "Authorization: Basic ", 21);
-		uint16_t auth_len = vpn_ws_base64_encode((uint8_t *)crd, strlen(crd), (uint8_t *)auth + 21);
+		uint16_t auth_len = vpn_ws_base64_encode((uint8_t *)auth_src, strlen(auth_src), (uint8_t *)auth + 21);
 		memcpy(auth + 21 + auth_len, "\r\n", 2); 
+		if (vpn_ws_conf.basic_auth_user) free(auth_src);
 	}
 
 	uint8_t *mac = vpn_ws_conf.tuntap_mac;
@@ -380,8 +405,8 @@ int vpn_ws_connect(vpn_ws_peer *peer, char *name) {
 #endif
 	uint16_t key_len = vpn_ws_base64_encode(secret, 10, key);
 	// now build and send the request
-	char buf[8192];
-	int ret = snprintf(buf, 8192, "GET /%s HTTP/1.1\r\nHost: %s\r\n%sUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %.*s\r\nX-vpn-ws-MAC: %02x:%02x:%02x:%02x:%02x:%02x%s\r\n\r\n",
+	char buf[16384];
+	int ret = snprintf(buf, sizeof(buf), "GET /%s HTTP/1.1\r\nHost: %s\r\n%sUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %.*s\r\nX-vpn-ws-MAC: %02x:%02x:%02x:%02x:%02x:%02x%s\r\n",
 		path ? path : "",
 		host_hdr,
 		auth ? auth : "",
@@ -396,10 +421,34 @@ int vpn_ws_connect(vpn_ws_peer *peer, char *name) {
 		vpn_ws_conf.bridge ? "\r\nX-vpn-ws-bridge: on" : ""
 	);
 
+	if (ret > 0) {
+		uint8_t i;
+		for(i=0;i<vpn_ws_conf.extra_headers_n;i++) {
+			char *eh = vpn_ws_conf.extra_headers[i];
+			if (!eh) continue;
+			int hdr_len = snprintf(buf + ret, sizeof(buf) - ret, "%s\r\n", eh);
+			if (hdr_len <= 0 || hdr_len >= (int) (sizeof(buf) - ret)) {
+				ret = -1;
+				break;
+			}
+			ret += hdr_len;
+		}
+	}
+
+	if (ret > 0) {
+		int end_len = snprintf(buf + ret, sizeof(buf) - ret, "\r\n");
+		if (end_len <= 0 || end_len >= (int) (sizeof(buf) - ret)) {
+			ret = -1;
+		}
+		else {
+			ret += end_len;
+		}
+	}
+
 	if (auth) free(auth);
 	free(host_hdr);
 
-	if (ret == 0 || ret > 8192) {
+	if (ret <= 0 || ret > sizeof(buf)) {
 		vpn_ws_log("vpn_ws_connect()/snprintf()");
 		free(connect_host);
 		return -1;
@@ -408,14 +457,17 @@ int vpn_ws_connect(vpn_ws_peer *peer, char *name) {
 	if (ssl) {
 		vpn_ws_conf.ssl_ctx = vpn_ws_ssl_handshake(peer, domain, vpn_ws_conf.ssl_key, vpn_ws_conf.ssl_crt);
 		if (!vpn_ws_conf.ssl_ctx) {
+			free(connect_host);
 			return -1;
 		}
 		if (vpn_ws_ssl_write(vpn_ws_conf.ssl_ctx, (uint8_t *)buf, ret)) {
+			free(connect_host);
 			return -1;
 		}
 	}
 	else {
 		if (vpn_ws_full_write(peer->fd, buf, ret)) {
+			free(connect_host);
 			return -1;
 		}		
 	}
@@ -460,6 +512,19 @@ int main(int argc, char *argv[]) {
                                 break;
                         case 3:
                                 vpn_ws_conf.ssl_crt = optarg;
+                                break;
+                        case 4:
+                                vpn_ws_conf.basic_auth_user = optarg;
+                                break;
+                        case 5:
+                                vpn_ws_conf.basic_auth_password = optarg;
+                                break;
+                        case 6:
+                                if (vpn_ws_conf.extra_headers_n >= 32) {
+                                        vpn_ws_warning("too many --header options (max 32)");
+                                        vpn_ws_exit(1);
+                                }
+                                vpn_ws_conf.extra_headers[vpn_ws_conf.extra_headers_n++] = optarg;
                                 break;
                         case '?':
                                 break;
