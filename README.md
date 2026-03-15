@@ -1,379 +1,356 @@
-vpn-ws
-======
+# Lollipop
 
-A VPN system over websockets
+Lollipop is an IP-only deployable tunneling system with two client-selectable transports:
 
-This is the client/server implementation of a layer-2 software switch able to route packets over websockets connections.
+1. **WSS mode (true VPN mode)**: Layer-2 TAP tunnel over secure websocket (`wss`).
+2. **HTTPS2 mode (experimental)**: request/response payload channel over HTTPS.
 
-The daemon is meant to be run behind nginx, apache, the uWSGI http router or a HTTP/HTTPS proxy able to speak the uwsgi protocol and to manage websockets connections
+Server side is Linux (Ubuntu) and Docker-based. Client side is Linux, macOS, Windows and iOS.
 
-How it works
-============
+---
 
-A client creates a tap (ethernet-like) local device and connects to a websocket server (preferably over HTTPS). Once the websocket handshake is done,
-every packet received from the tuntap will be forwarded to the websocket server, and every websocket packet received from the server will be forwarded
-to the tuntap device.
+## 1. Overview
 
-The server side of the stack can act as a simple switch (no access to the network, only connected nodes can communicate), a bridge (a tuntap device is created in
-the server itself that can forward packets to the main network stack) a simpe router/gateway (give access to each node to specific networks without allowing communication between nodes) or whatever
-you can think of. (The server is voluntary low-level to allow all the paradigms supported by the network stack).
+### 1.1 Architecture
 
-Authentication/Authorization and Security
-=========================================
+- **Server runtime**: `lollipop-server` behind nginx inside Docker.
+- **Client runtime**:
+  - Linux: GUI + CLI
+  - macOS: GUI
+  - Windows: GUI (no CLI requirement)
+  - iOS: GUI app + Packet Tunnel extension
+- **Security**: self-signed certificate generated for IP SAN; no domain required.
 
-Authentication and Authorization is delegated to the proxy. We believe that battle-tested webservers (like nginx and apache) cover basically every authentication and security need, so there is no need to reimplement them.
+### 1.2 What is “true VPN” here?
 
-By default only HTTPS access (eventually with client certificate authentication) should be allowed, but plain-http mode is permitted for easy debugging.
+Use **WSS + TAP** mode and route default traffic through the tunnel interface.
 
-Virtualhosting
-==============
+- Linux/macOS: route control done by client-side network settings (documented below).
+- iOS: route control done in `PacketTunnelProvider` network settings.
+- HTTPS2 mode is experimental and not equivalent to full L2 VPN transport.
 
-A vpn-ws client is required to send the Host header during the handshake and "should" support SNI. In this way virtualhosting can be easily managed by the proxy server.
+---
 
+## 2. Repository map (file-by-file purpose)
 
-Installation from sources
-=========================
+### Core C runtime
 
-note: see below for binary packages
+- `src/main.c` - server entry/event loop.
+- `src/client.c` - native client (WSS transport, auth, headers JSON handling).
+- `src/io.c` - frame forwarding logic.
+- `src/tuntap.c` - TAP creation and TAP I/O.
+- `src/socket.c` - IPv4/IPv6/unix socket helpers.
+- `src/ssl.c` - TLS support for client.
+- `src/uwsgi.c` - nginx/uWSGI integration + handshake response.
+- `src/vpn-ws.h` - shared structs and declarations.
 
-You need gnu make and a c compiler (clang, gcc, and mingw-gcc are supported).
+### Build/runtime packaging
 
-The server has no external dependancies, while the client requires openssl (except for OSX and Windows where their native ssl/tls implementation is used)
+- `Makefile` - builds `lollipop-server` and `lollipop-client` (+ compatibility copies).
+- `docker/Dockerfile` - full server image.
+- `docker/entrypoint.sh` - startup + cert generation + process launch.
+- `docker/nginx.conf.template` - nginx routes for WSS and HTTPS2 modes.
 
-Just run (remember to use 'gmake' on FreeBSD instead of 'make')
+### HTTPS2 experimental transport
 
-```sh
+- `server_h2/https2_payload_server.py` - queue-based send/recv service.
+- `clients/https2_payload_cli.py` - one-shot send/recv client.
+- `clients/https2_payload_poll.py` - long-poll receive loop.
+- `clients/utls/main.go` - uTLS HTTP/2 client (browser-like TLS fingerprint).
+
+### Desktop GUI clients
+
+- `clients/lollipop_gui.py` - main desktop GUI.
+- `clients/linux/lollipop.sh` - Linux GUI launcher.
+- `clients/macos/lollipop.command` - macOS GUI launcher.
+- `clients/windows/lollipop.bat` - Windows GUI launcher.
+
+### iOS client
+
+- `clients/ios/LollipopApp/LollipopApp.swift` - app entry.
+- `clients/ios/LollipopApp/ContentView.swift` - app UI.
+- `clients/ios/LollipopApp/LollipopVPNManager.swift` - profile/config management.
+- `clients/ios/LollipopTunnel/PacketTunnelProvider.swift` - tunnel extension logic.
+- `clients/ios/README.md` - exhaustive iOS build/deploy steps.
+
+### Config templates
+
+- `config/browser_headers.example.json` - full headers template for request customization.
+
+---
+
+## 3. Installation and dependencies
+
+## 3.1 Server side (Ubuntu only)
+
+### Install Docker on Ubuntu VPS
+
+```bash
+sudo apt update
+sudo apt install -y ca-certificates curl gnupg
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable docker
+sudo systemctl start docker
+```
+
+### Build server image
+
+```bash
+git clone <your-fork-or-repo-url> lollipop
+cd lollipop
+docker build -t lollipop-server -f docker/Dockerfile .
+```
+
+### Run server container (IP-only)
+
+```bash
+docker run -d \
+  --name lollipop-server \
+  -p 80:80 -p 443:443 \
+  -e SERVER_IPV4=203.0.113.10 \
+  -e SERVER_IPV6=2001:db8::10 \
+  -v lollipop-certs:/data/certs \
+  lollipop-server
+```
+
+### Generated certificate paths
+
+- `/data/certs/cucumber.crt`
+- `/data/certs/potato.key`
+
+Copy public cert:
+
+```bash
+docker cp lollipop-server:/data/certs/cucumber.crt ./cucumber.crt
+```
+
+---
+
+## 3.2 Linux client dependencies
+
+### GUI mode
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-pip
+python3 -m pip install --user PyQt5 requests
+```
+
+### CLI mode (Linux only)
+
+```bash
+sudo apt install -y build-essential make gcc libssl-dev
+make clean
 make
 ```
 
-after having cloned the repository. If all goes well you will end with a binary named vpn-ws (the server) and another named vpn-ws-client (the client)
+---
 
-You can eventually build server or client selectively with
-```sh
-make vpn-ws
-make vpn-ws-client
+## 3.3 macOS client dependencies
+
+- Install Python 3 (Homebrew or python.org)
+- Install GUI dependencies:
+
+```bash
+python3 -m pip install PyQt5 requests
 ```
 
-You can build a static binary version too of the server (where supported) with:
+- Install TAP driver if using true WSS VPN mode.
 
-```sh
-make vpn-ws-static
-```
-the resulting binary (vpn-ws) will have no library dependancies.
+---
 
-Binary packages
-===============
+## 3.4 Windows client dependencies (GUI only)
 
-updated to [20141121]
+- Install Python 3.11+ (enable “Add python to PATH”).
+- Install dependencies:
 
-* linux x86_64 static server (https://github.com/unbit/vpn-ws/releases/download/v0.2/vpn-ws-0.2-linux-x86_64.tar.gz)
-* linux i386 static server (https://github.com/unbit/vpn-ws/releases/download/v0.2/vpn-ws-0.2-linux-i386.tar.gz)
-* linux raspberrypi (raspbian) (https://github.com/unbit/vpn-ws/releases/download/v0.2/vpn-ws-0.2-linux-armv6l.tar.gz)
-* freebsd x86_64 static server (https://github.com/unbit/vpn-ws/releases/download/v0.2/vpn-ws-0.2-freebsd-amd64.tar.gz)
-* osx universal binary client and server (https://github.com/unbit/vpn-ws/releases/download/v0.2/vpn-ws-0.2-osx.pkg)
-* windows client (https://github.com/unbit/vpn-ws/releases/download/v0.2/vpn-ws-client.exe)
-
-
-Running the server
-==================
-
-by default the server binary takes a single argument, the name of the socket to bind (the one to which the proxy will connect to):
-
-```sh
-./vpn-ws /run/vpn.sock
+```powershell
+py -m pip install PyQt5 requests
 ```
 
-will bind to /run/vpn.sock
+- Build binaries once (on Windows with build toolchain) or use provided/prebuilt `lollipop-client.exe` in your packaging flow.
+- Launch GUI via `clients\windows\lollipop.bat`.
 
-Now you only need to configure your webserver/proxy to route requests to /run/vpn.sock using the uwsgi protocol (see below)
+> Windows usage is GUI-first in this project; terminal operation is not required.
 
-Nginx
-=====
+---
 
-Nginx will be your "shield", managing the authentication/authorization phase. HTTPS + basicauth is strongly suggested, but best setup would be HTTPS + certificates authentication. You can run with plain HTTP and without auth, but please, do not do it, unless for testing ;)
+## 3.5 iOS client dependencies
 
-You need to choose the location for which nginx will forward requests to the vpn-ws server:
+- macOS + Xcode 15+
+- Apple Developer account with NetworkExtension capability
+- Real iPhone/iPad for deployment
 
-(we use /vpn)
+Detailed click-by-click instructions are in `clients/ios/README.md`.
 
-```nginx
-location /vpn {
-  include uwsgi_params;
-  uwsgi_pass unix:/run/vpn.sock;
-}
+---
+
+## 4. Common client options (same concept across all GUIs)
+
+All GUI clients expose the same conceptual fields:
+
+- Server IP
+- Port
+- Path
+- Username
+- Password
+- Protocol selector: `wss` / `https2`
+- Headers JSON config
+- Connect button
+- Disconnect button
+
+Desktop GUI also includes optional cert path and HTTPS2 send payload helper.
+
+---
+
+## 5. Headers JSON config (only JSON, no manual header flags)
+
+Use `config/browser_headers.example.json` as your template and edit values.
+
+Linux CLI usage (Linux only):
+
+```bash
+sudo ./lollipop-client \
+  --user cucumber \
+  --password potato \
+  --headers-json ./config/browser_headers.example.json \
+  vpn-ws0 wss://203.0.113.10/cucumber
 ```
 
-this a setup without authentication, a better one (with basicauth) could be:
-```nginx
-location /vpn {
-  include uwsgi_params;
-  uwsgi_pass unix:/run/vpn.sock;
-  auth_basic "VPN";
-  auth_basic_user_file /etc/nginx/.htpasswd;
-}
+Desktop GUI / iOS:
+- choose/import this JSON from GUI.
+
+---
+
+## 6. End-to-end usage
+
+## 6.1 Linux GUI
+
+```bash
+./clients/linux/lollipop.sh
 ```
 
-where /etc/nginx/.htpasswd will be the file containing credentials (you can use the htpasswd tool to generate them)
+### Linux GUI visual map
 
-The Official Client
-===================
+- **Top fields**: server IP/port/path/user/password
+- **Protocol selector**: `wss` or `https2`
+- **Headers JSON**: file path + browse button
+- **Buttons**:
+  - `Connect`
+  - `Disconnect`
+  - `Send HTTPS2 payload`
+- **Logs panel**: connection and runtime messages
 
-The official client (vpn-ws-client) is a command line tool (written in C). Its syntax is pretty simple:
+## 6.2 macOS GUI
 
-```sh
-vpn-ws-client <tap> <server>
+```bash
+./clients/macos/lollipop.command
 ```
 
-where 'tap' is a (platform-dependent) tap device path, and 'server' is the url of the nginx /vpn path (in the ws://|wss:// form)
+Visual layout and controls are the same as Linux GUI.
 
-Before using the client, you need to ensure you have some form of tun/tap implementation. Linux, FreeBSD and OpenBSD already have it out-of the box. 
+## 6.3 Windows GUI
 
-For OSX you need to install 
-
-http://sourceforge.net/projects/tuntaposx/files/tuntap/20141104
-
-while on Windows (ensure to select utils too, when running the installer)
-
-http://swupdate.openvpn.org/community/releases/tap-windows-9.9.2_3.exe
-
-The client must be run as root/sudo (as it requires to create a network interface [TODO: drop privileges after having created the interface).
-
-On linux (you can name devices as you want):
-
-```sh
-./vpn-ws-client vpn-ws0 wss://foo:bar@example.com/vpn
+```bat
+clients\windows\lollipop.bat
 ```
 
-On OSX (you have a fixed number of /dev/tapN devices you can use)
+Visual layout and controls are the same as Linux GUI.
 
-```sh
-./vpn-ws-client /dev/tap0 wss://foo:bar@example.com/vpn
+## 6.4 iOS GUI
+
+Follow `clients/ios/README.md` and run app on device.
+
+### iOS visual map
+
+- **Server section**: IP, port, path, protocol segmented control
+- **Authentication section**: username/password
+- **Headers JSON section**: import button + JSON editor text area
+- **Actions**: Save Profile, Connect/Disconnect
+- **Status section**: current state/errors
+
+---
+
+## 7. True VPN routing behavior
+
+## 7.1 Linux full-traffic example
+
+After WSS connection:
+
+```bash
+sudo ip link set vpn-ws0 up
+sudo ip addr add 10.99.0.2/24 dev vpn-ws0
+sudo ip route replace default dev vpn-ws0
 ```
 
-On FreeBSD (you need to create the interface to access the device):
+To revert:
 
-```sh
-ifconfig tap0 create
-./vpn-ws-client /dev/tap0 wss://foo:bar@example.com/vpn
+```bash
+sudo dhclient
 ```
 
-On windows (you need to create a tap device via the provided utility and assign it a name, like 'foobar')
+## 7.2 macOS full-traffic example
 
-```sh
-./vpn-ws-client foobar wss://foo:bar@example.com/vpn
+After WSS connection:
+
+```bash
+sudo ifconfig tap0 10.99.0.3 10.99.0.1 up
+sudo route change default 10.99.0.1
 ```
 
-Once your client is connected you can assign it an ip address (or make a dhcp request if one of the connected nodes has a running dhcp server)
+To revert default route back to your normal gateway.
 
-The mode we are using now is the simple "switch" one, where nodes simply communicates between them like in a lan.
+## 7.3 iOS
 
-Server tap and Bridge mode
-==========================
+Route behavior is controlled by `NEPacketTunnelNetworkSettings` in `PacketTunnelProvider.swift`.
 
-By default the server acts a simple switch, routing packets to connected peers based on the advertised mac address.
+---
 
-In addition to this mode you can give the vpn-ws server a virtual device too (with its mac address) to build complex setup.
+## 8. Build iOS app from scratch
 
-To add a device to the vpn-ws server:
+Use `clients/ios/README.md`.
 
-```sh
-./vpn-ws --tuntap vpn0 /run/vpn.sock
-```
+That guide includes exact Xcode UI flow:
+- what to click,
+- which template to choose,
+- which bundle identifiers to set,
+- where to add capabilities,
+- how to deploy to physical iPhone.
 
-the argument of tuntap is platform dependent (the same rules of clients apply).
+---
 
-The 'vpn0' interface is considered like connected nodes, so once you give it an ip address it will join the switch.
+## 9. Testing checklist (from this README flow)
 
-One of the use case you may want to follow is briding the vpn with your physical network (in the server). For building it you need the server to forward packets without a matching connected peers to the tuntap device. This is the bridge mode. To enable it add --bridge to the server command line:
+- Build native binaries.
+- Validate Python client scripts syntax.
+- Validate Go uTLS client build.
+- Localhost HTTPS2 send/recv smoke test.
 
-```sh
-./vpn-ws --bridge --tuntap vpn0 /run/vpn.sock
-```
+(See “Tests run” section below for executed commands.)
 
-Now you can add 'vpn0' to a pre-existing network bridge:
+---
 
-```sh
-# linux example
-brctl addbr br0
-brctl addif br0 eth0
-brctl addif br0 vpn0
-```
+## 10. Tests run for this revision
 
-Client bridge-mode
-==================
+Executed in Linux environment:
 
-This mode allows a client to act as a bridge giving access to its whole network to the vpn (and it clients).
-
-Just add --bridge to the client command line and attach the tuntap device to a bridge.
-
-The main problem is that you still need a route to the vpn server, so the best approach would be having two network interfaces on the client (one for the connection with the server, and the other for the physical bridge).
-
-On linux, you can use the macvlan interface (it is basically a copy of a physical interface with a different mac address):
-
-```sh
-ip link add link eth0 name virt0 type macvlan
-ifconfig virt0 0.0.0.0 promisc up
-brctl addif br0 virt0
-# add vpn-ws tuntap device to the bridge
-ifconfig vpn17 0.0.0.0 promisc up
-brctl addif br0 vpn17
-```
-
-
-The --exec trick
-================
-
-Both the server and client take an optional argument named '--exec <cmd>'. This option will instruct the server/client to execute a command soon after the tuntap device is created.
-
-As an example you may want to call ifconfig upon connection:
-
-```sh
-vpn-ws-client --exec "ifconfig vpn17 192.168.173.17 netmask 255.255.255.0" vpn17 wss://example.com/
-```
-
-or to add your server to a tuntap to an already existent bridge:
-
-```sh
-vpn-ws --exec "brctl addif br0 vpn0" --bridge --tuntap vpn0 /run/vpn.sock
-```
-
-You can chain multiple commands with ;
-
-```sh
-vpn-ws --exec "brctl addif br0 vpn0; ifconfig br0 192.168.173.30" --bridge --tuntap vpn0 /run/vpn.sock
-```
-
-Required permissions
-====================
-
-The server, when no tuntap device is created, does not require specific permissions. If bound to a unix socket, it will give the 666 permission to the scket itself, in this way nginx (or whatever proxy you are using) will be able to connect to it.
-
-If the server needs to create a tap device, root permissions are required. By the way you can drop privileges soon after the device is created (and the --exec option is eventually executed) with the --uid ang --gid options:
-
-```sh
-vpn-ws --tuntap vpn0 --uid www-data --gid www-data /run/vpn.sock
-```
-
-The client instead requires privileged operations (future releases may allow dropping privileges in the client too)
-
-Client-certificate authentication
-=================================
-
-Your client can supply a certificate for authenticating to the server.
-
-On OpenSSL-based clients (Linux, FreeBSD) you need a key file and a certificate in pem format:
-
-```sh
-vpn-ws-client --key foobar.key --crt foobar.crt vpn0 wss://example.com/vpn
-```
-
-On OSX you need to import a .p12 file (or whatever format it support) to the login keychain, then you need to specify the name of the certificate/identity via the --crt option (no --key is involved):
-
-```sh
-vpn-ws-client --crt "My certificate" /dev/tap0 wss://example.com/vpn
-```
-
-
-The JSON Control interface
-==========================
-
-The uwsgi protocol supports a raw form of channel selections using 2 bytes of its header. Thos bytes are called "modifiers". By setting the modifier1 to '1' (by default modifiers are set to 0) you will tell the vpn-ws server to show the JSON control interface. This is a simple way for monitoring the server and for kicking out clients.
-
-When connectin to modifier1, a json blob with the data of all connected clients is shown. Passing a specific QUERY_STRING you can issue commands (currently only killing peers is implemented)
-
-```nginx
-location /vpn {
-  include uwsgi_params;
-  uwsgi_pass unix:/run/vpn.sock;
-  auth_basic "VPN";
-  auth_basic_user_file /etc/nginx/.htpasswd;
-}
-
-location /vpn_admin {
-  include uwsgi_params;
-  uwsgi_modifier1 1;
-  uwsgi_pass unix:/run/vpn.sock;
-  auth_basic "VPN ADMIN";
-  auth_basic_user_file /etc/nginx/.htpasswd;
-}
-```
-
-You can now connect to /vpn_admin to see a json representation of connected clients. Each peer has an id. you can kick-out that peer/client adding a query string to the bar: 
-
-/vpn_admin?kill=n
-
-where n is the id of the specific client.
-
-If needed, more commands could be added in the future.
-
-
-Example Clients
-===============
-
-In the clients/ directory there are a bunch of clients you can run on your nodes or you can use as a base for developing more advanced ones.
-
-Clients must run as root/sudo as they need to create/interact with tuntap devices
-
-* vpn_linux_tornado.py - a linux-only client based on tornado and ws4py
-
-```sh
-sudo pip install tornado ws4py python-pytun
-sudo python clients/vpn_linux_tornado.py ws://your_server/
-```
-
-* vpn.pl - more-or-less platform independent perl client (works with OSX and FreeBSD)
-
-```sh
-sudo cpanm AnyEvent::WebSocket::Client
-sudo perl clients/vpn.pl /dev/tap0 ws://your_server/
-```
-
-As the official client you need to ensure a tuntap device implementation is available on the system
-
-then (after having connected to the vpn server) you can assign the ip to it
-
-Remember that we are at layer-2, so if you place a dhcp server on one of those nodes it will work as expected.
-
-
-Multicast and Broadcast
-=======================
-
-They are both supported, (yes bonjour, mdns, samba will work !).
-
-You can eventually turn off them selectively adding
-
-* --no-broadcast
-* --no-multicast
-
-to the server command line
-
-Tutorials
-=========
-
-https://github.com/unbit/vpn-ws/blob/master/tutorials/ubuntu_trusty_nginx_bridge_client_certificates.md
-
-
-Support
-=======
-
-https://groups.google.com/d/forum/vpn-ws
-
-(or drop a mail to info at unbit dot it for commercial support)
-
-Twitter
-=======
-
-(mainly for announces)
-
-@unbit
-
-Status/TODO/Working on
-======================
-
-The server on windows is still a work in progress
-
-The client on windows has no support for SSL/TLS
-
-Grant support for NetBSD, and DragonflyBSD
-
-Investigate solaris/smartos/omnios support
+1. `make clean && make`
+2. `python3 -m py_compile clients/lollipop_gui.py clients/https2_payload_cli.py clients/https2_payload_poll.py server_h2/https2_payload_server.py`
+3. `cd clients/utls && go build .`
+4. Installed required Python deps for local tests:
+   - `python3 -m pip install --user requests flask`
+5. Localhost integration test:
+   - `python3 server_h2/https2_payload_server.py`
+   - `python3 clients/https2_payload_cli.py --base http://127.0.0.1:18080 --client-id test1 --send "hello-local"`
+   - `python3 clients/https2_payload_cli.py --base http://127.0.0.1:18080 --client-id test1 --recv`
+   - verified payload round-trip.
