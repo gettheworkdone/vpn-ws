@@ -14,10 +14,87 @@ static struct option vpn_ws_options[] = {
         {"user", required_argument, NULL, 4 },
         {"password", required_argument, NULL, 5 },
         {"header", required_argument, NULL, 6 },
+        {"headers-json", required_argument, NULL, 7 },
         {"no-verify", no_argument, &vpn_ws_conf.ssl_no_verify, 1 },
 	{"bridge", no_argument, &vpn_ws_conf.bridge, 1 },
         {NULL, 0, 0, 0}
 };
+
+
+static int vpn_ws_add_extra_header(char *header) {
+	if (vpn_ws_conf.extra_headers_n >= 32) {
+		vpn_ws_warning("too many headers (max 32)");
+		return -1;
+	}
+	vpn_ws_conf.extra_headers[vpn_ws_conf.extra_headers_n++] = header;
+	return 0;
+}
+
+static int vpn_ws_load_headers_json(char *path) {
+	FILE *fp = fopen(path, "rb");
+	if (!fp) {
+		vpn_ws_error("vpn_ws_load_headers_json()/fopen()");
+		return -1;
+	}
+	if (fseek(fp, 0, SEEK_END)) {
+		fclose(fp);
+		return -1;
+	}
+	long flen = ftell(fp);
+	if (flen <= 0 || flen > 65535) {
+		fclose(fp);
+		vpn_ws_warning("invalid headers json size");
+		return -1;
+	}
+	rewind(fp);
+	char *json = vpn_ws_calloc(flen + 1);
+	if (!json) {
+		fclose(fp);
+		return -1;
+	}
+	if (fread(json, 1, flen, fp) != (size_t)flen) {
+		free(json);
+		fclose(fp);
+		return -1;
+	}
+	fclose(fp);
+
+	char *ptr = json;
+	while ((ptr = strchr(ptr, '"'))) {
+		char *k_start = ptr + 1;
+		char *k_end = strchr(k_start, '"');
+		if (!k_end) break;
+		char *colon = strchr(k_end + 1, ':');
+		if (!colon) break;
+		char *v_quote = strchr(colon + 1, '"');
+		if (!v_quote) break;
+		char *v_start = v_quote + 1;
+		char *v_end = strchr(v_start, '"');
+		if (!v_end) break;
+
+		size_t key_len = k_end - k_start;
+		size_t val_len = v_end - v_start;
+		if (key_len == 0 || val_len == 0) {
+			ptr = v_end + 1;
+			continue;
+		}
+		char *hdr = vpn_ws_calloc(key_len + 2 + val_len + 1);
+		if (!hdr) {
+			free(json);
+			return -1;
+		}
+		snprintf(hdr, key_len + 2 + val_len + 1, "%.*s: %.*s", (int)key_len, k_start, (int)val_len, v_start);
+		if (vpn_ws_add_extra_header(hdr)) {
+			free(hdr);
+			free(json);
+			return -1;
+		}
+		ptr = v_end + 1;
+	}
+
+	free(json);
+	return 0;
+}
 
 #ifdef __WIN32__
 /*
@@ -520,11 +597,14 @@ int main(int argc, char *argv[]) {
                                 vpn_ws_conf.basic_auth_password = optarg;
                                 break;
                         case 6:
-                                if (vpn_ws_conf.extra_headers_n >= 32) {
-                                        vpn_ws_warning("too many --header options (max 32)");
+                                if (vpn_ws_add_extra_header(optarg)) {
                                         vpn_ws_exit(1);
                                 }
-                                vpn_ws_conf.extra_headers[vpn_ws_conf.extra_headers_n++] = optarg;
+                                break;
+                        case 7:
+                                if (vpn_ws_load_headers_json(optarg)) {
+                                        vpn_ws_exit(1);
+                                }
                                 break;
                         case '?':
                                 break;

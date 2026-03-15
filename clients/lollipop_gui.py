@@ -8,7 +8,6 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
-from urllib.parse import quote
 
 from PyQt5.QtCore import QProcess
 from PyQt5.QtWidgets import (
@@ -154,7 +153,7 @@ class LollipopWindow(QMainWindow):
             if self.proto_h2.isChecked():
                 base = self.build_h2_base()
                 args = [
-                    str(Path(__file__).with_name("h2_tunnel_loop.py")),
+                    str(Path(__file__).with_name("https2_payload_poll.py")),
                     "--base",
                     base,
                     "--client-id",
@@ -171,8 +170,8 @@ class LollipopWindow(QMainWindow):
                 if cert:
                     args.extend(["--crt", cert])
                 args.extend([self.tap.text().strip(), url])
-                self.log(f"[Lollipop] Starting vpn-ws-client {' '.join(args)}")
-                self.process.start("vpn-ws-client", args)
+                self.log(f"[Lollipop] Starting lollipop-client {' '.join(args)}")
+                self.process.start("lollipop-client", args)
 
             if not self.process.waitForStarted(5000):
                 QMessageBox.critical(self, "Lollipop", "Failed to start process")
@@ -196,7 +195,7 @@ class LollipopWindow(QMainWindow):
 
         cmd = [
             "python3",
-            str(Path(__file__).with_name("h2_tunnel_client.py")),
+            str(Path(__file__).with_name("https2_payload_cli.py")),
             "--base",
             base,
             "--client-id",

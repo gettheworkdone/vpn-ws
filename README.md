@@ -1,49 +1,134 @@
-# Lollipop transport toolkit
+# Lollipop
 
-Lollipop now exposes two transport modes:
+Lollipop is a transport toolkit with two modes:
 
-1. **WSS mode** (`wss://`) for persistent websocket Layer-2 tunneling (`vpn-ws` + `vpn-ws-client`).
-2. **HTTPS2 mode** (`https://...` request/response) for payload tunneling without persistent websocket sessions.
+1. **True VPN mode (recommended):** `wss` + TAP (Layer-2 tunnel), using `lollipop-server` and `lollipop-client`.
+2. **HTTPS2 payload mode (experimental):** request/response payload transport over HTTPS.
 
-Both modes are available in desktop GUI and iOS client switchers.
+Everything works with **IP-only server setup** (no domain required).
 
 ---
 
-## 1) Build
+## 1) Project file map (what each file does)
+
+### Core C implementation
+
+- `src/main.c` - server event loop entry point.
+- `src/client.c` - native client entry point and websocket handshake logic.
+- `src/io.c` - frame forwarding between TAP and websocket peers.
+- `src/tuntap.c` - TAP/TUN device creation and I/O.
+- `src/socket.c` - bind/connect helpers (IPv4/IPv6/unix socket).
+- `src/ssl.c` - TLS handling for native client.
+- `src/uwsgi.c` - nginx/uWSGI request parsing and websocket upgrade response.
+- `src/vpn-ws.h` - shared structures and function declarations.
+
+### Build and packaging
+
+- `Makefile` - builds `lollipop-server`, `lollipop-client` and compatibility copies (`vpn-ws`, `vpn-ws-client`).
+- `docker/Dockerfile` - docker server image.
+- `docker/entrypoint.sh` - container startup, cert generation, starts nginx + backend services.
+- `docker/nginx.conf.template` - nginx routes for WSS and HTTPS2 modes.
+
+### HTTPS2 experimental transport
+
+- `server_h2/https2_payload_server.py` - simple queue-based payload server (`/send`, `/recv`).
+- `clients/https2_payload_cli.py` - one-shot send/recv CLI for HTTPS2 mode.
+- `clients/https2_payload_poll.py` - long-poll receiver helper.
+- `clients/utls/main.go` - uTLS-based HTTPS2 client (browser-like TLS fingerprint).
+- `clients/utls/go.mod`, `clients/utls/go.sum` - Go module dependencies.
+
+### Desktop clients
+
+- `clients/lollipop_gui.py` - desktop GUI with protocol switch (`ws`, `wss`, `https2`).
+- `clients/linux/lollipop.sh` - Linux launcher.
+- `clients/macos/lollipop.command` - macOS launcher.
+- `clients/windows/lollipop.bat` - Windows launcher.
+
+### iOS client
+
+- `clients/ios/LollipopApp/LollipopApp.swift` - SwiftUI app root.
+- `clients/ios/LollipopApp/ContentView.swift` - iOS UI and protocol selector (`wss`/`https2`).
+- `clients/ios/LollipopApp/LollipopVPNManager.swift` - profile save/load and tunnel start/stop.
+- `clients/ios/LollipopTunnel/PacketTunnelProvider.swift` - packet tunnel extension logic.
+- `clients/ios/README.md` - full Xcode from-scratch build guide.
+
+### Config
+
+- `config/browser_headers.example.json` - sample header configuration JSON for `--headers-json`.
+
+---
+
+## 2) Build binaries
 
 ```bash
 make clean
 make
 ```
 
-Binaries:
+Output binaries:
+
+- `./lollipop-server`
+- `./lollipop-client`
+
+Compatibility copies also generated:
+
 - `./vpn-ws`
 - `./vpn-ws-client`
 
 ---
 
-## 2) Configurable request headers
+## 3) Header customization JSON
 
-Native client supports repeatable browser-like header overrides:
+Lollipop client now supports:
+
+- `--header "Name: Value"` (repeatable)
+- `--headers-json /path/to/file.json`
+
+Example JSON (`config/browser_headers.example.json`):
+
+```json
+{
+  "User-Agent": "Mozilla/5.0 ...",
+  "Accept": "text/html,...",
+  "Accept-Language": "en-US,en;q=0.9"
+}
+```
+
+Usage:
 
 ```bash
-sudo ./vpn-ws-client \
+sudo ./lollipop-client \
   --user cucumber \
   --password potato \
-  --header "User-Agent: Mozilla/5.0" \
-  --header "Accept-Language: en-US,en;q=0.9" \
-  --header "Cache-Control: no-cache" \
+  --headers-json ./config/browser_headers.example.json \
   vpn-ws0 wss://127.0.0.1/cucumber
 ```
 
-Options:
-- `--user`
-- `--password`
-- `--header "Name: Value"` (max 32)
+---
+
+## 4) Install Docker on Ubuntu VPS
+
+```bash
+sudo apt update
+sudo apt install -y ca-certificates curl gnupg
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable docker
+sudo systemctl start docker
+```
 
 ---
 
-## 3) Docker server (nginx + vpn-ws + https2 payload service)
+## 5) Run server in Docker (IP only, no domain)
 
 ### Build image
 
@@ -51,19 +136,19 @@ Options:
 docker build -t lollipop-server -f docker/Dockerfile .
 ```
 
-### Run
+### Run container
 
 ```bash
 docker run -d \
   --name lollipop-server \
   -p 80:80 -p 443:443 \
-  -e SERVER_IPV4=127.0.0.1 \
-  -e SERVER_IPV6=::1 \
+  -e SERVER_IPV4=203.0.113.10 \
+  -e SERVER_IPV6=2001:db8::10 \
   -v lollipop-certs:/data/certs \
   lollipop-server
 ```
 
-### Generated cert paths
+### Certificate paths (generated automatically)
 
 - cert: `/data/certs/cucumber.crt`
 - key: `/data/certs/potato.key`
@@ -74,112 +159,138 @@ Copy cert to host:
 docker cp lollipop-server:/data/certs/cucumber.crt ./cucumber.crt
 ```
 
-No VPN words are used in generated certificate naming.
+Then install/trust `cucumber.crt` on clients.
 
 ---
 
-## 4) Localhost test on Linux (required smoke test)
+## 6) Localhost Linux test (verified flow)
 
-This verifies the new HTTPS2 mode end-to-end on localhost.
-
-### Start experimental payload server locally
+### A. Start HTTPS2 test server locally
 
 ```bash
-python3 server_h2/h2_tunnel_server.py
+python3 -m pip install --user flask requests
+python3 server_h2/https2_payload_server.py
 ```
 
-In a second terminal:
+### B. In second terminal, send then receive
 
 ```bash
-python3 clients/h2_tunnel_client.py --base http://127.0.0.1:18080 --client-id test1 --send "hello-local"
-python3 clients/h2_tunnel_client.py --base http://127.0.0.1:18080 --client-id test1 --recv
+python3 clients/https2_payload_cli.py --base http://127.0.0.1:18080 --client-id test1 --send "hello-local"
+python3 clients/https2_payload_cli.py --base http://127.0.0.1:18080 --client-id test1 --recv
 ```
 
-Expected: second command prints `hello-local`.
+Expected: `hello-local` is returned.
 
 ---
 
-## 5) uTLS client for browser-like TLS fingerprint
+## 7) True VPN requirement (route all traffic)
 
-If you want browser-like TLS handshake fingerprinting, use included Go uTLS client:
+For **full-device traffic routing**, use **WSS mode + TAP + default route changes**.
 
-- source: `clients/utls/main.go`
-- module: `clients/utls/go.mod`
+### Linux example (all traffic)
 
-Run:
+```bash
+sudo ./lollipop-client --user cucumber --password potato vpn-ws0 wss://203.0.113.10/cucumber
+sudo ip link set vpn-ws0 up
+sudo ip addr add 10.99.0.2/24 dev vpn-ws0
+sudo ip route replace default dev vpn-ws0
+```
+
+### macOS example (all traffic)
+
+1. Install TAP driver.
+2. Start client:
+
+```bash
+sudo ./lollipop-client --user cucumber --password potato /dev/tap0 wss://203.0.113.10/cucumber
+```
+
+3. Assign address and default route (example):
+
+```bash
+sudo ifconfig tap0 10.99.0.3 10.99.0.1 up
+sudo route change default 10.99.0.1
+```
+
+### iOS
+
+On iOS, full-device routing is controlled by the Packet Tunnel extension and network settings set in `PacketTunnelProvider.swift`.
+
+> HTTPS2 mode is experimental payload transport and not equivalent to full L2 VPN behavior.
+
+---
+
+## 8) Desktop client usage (Linux + macOS + Windows)
+
+### Install dependencies
+
+Linux/macOS:
+
+```bash
+python3 -m pip install PyQt5 requests
+```
+
+### Launch
+
+Linux:
+
+```bash
+./clients/linux/lollipop.sh
+```
+
+macOS:
+
+```bash
+./clients/macos/lollipop.command
+```
+
+Windows:
+
+```bat
+clients\windows\lollipop.bat
+```
+
+In GUI choose protocol:
+
+- `wss` for true VPN tunnel
+- `https2` for payload mode
+
+---
+
+## 9) iOS full build from scratch
+
+Read and follow:
+
+- `clients/ios/README.md`
+
+That document includes:
+
+- project creation fields,
+- extension creation,
+- bundle IDs/signing,
+- capability setup,
+- device deployment,
+- certificate trust and troubleshooting.
+
+---
+
+## 10) uTLS client (browser-like TLS fingerprint)
 
 ```bash
 cd clients/utls
 go mod tidy
-go run . --base https://127.0.0.1/potato_h2 --client-id test1 --send "hello"
-go run . --base https://127.0.0.1/potato_h2 --client-id test1 --recv
+go run . --base https://203.0.113.10/potato_h2 --client-id test1 --send "hello"
+go run . --base https://203.0.113.10/potato_h2 --client-id test1 --recv
 ```
 
-This uses `utls.HelloChrome_Auto` for TLS handshake shaping.
+This uses `utls.HelloChrome_Auto`.
 
 ---
 
-## 6) WSS mode usage
+## 11) WSS and HTTPS2 endpoints in docker nginx
 
-```bash
-sudo ./vpn-ws-client --user cucumber --password potato vpn-ws0 wss://127.0.0.1/cucumber
-```
+- WSS path: `/cucumber`
+- HTTPS2 send path: `/potato_h2/send`
+- HTTPS2 recv path: `/potato_h2/recv`
 
-IPv6:
-
-```bash
-sudo ./vpn-ws-client --user cucumber --password potato vpn-ws0 wss://[::1]/cucumber
-```
-
----
-
-## 7) HTTPS2 mode usage
-
-Paths served by nginx in docker stack:
-- `POST /potato_h2/send`
-- `GET /potato_h2/recv`
-
-CLI example:
-
-```bash
-python3 clients/h2_tunnel_client.py \
-  --base https://127.0.0.1/potato_h2 \
-  --client-id node1 \
-  --cafile ./cucumber.crt \
-  --send "hello-from-client"
-
-python3 clients/h2_tunnel_client.py \
-  --base https://127.0.0.1/potato_h2 \
-  --client-id node1 \
-  --cafile ./cucumber.crt \
-  --recv
-```
-
----
-
-## 8) Client protocol switchers (all platforms)
-
-### Linux / macOS / Windows
-
-Use `clients/lollipop_gui.py` (launchers in `clients/linux`, `clients/macos`, `clients/windows`).
-
-GUI protocol selector now includes:
-- `ws`
-- `wss`
-- `https2`
-
-### iOS
-
-`clients/ios/LollipopApp/ContentView.swift` includes protocol segmented selector:
-- `wss`
-- `https2`
-
-Tunnel provider in `clients/ios/LollipopTunnel/PacketTunnelProvider.swift` handles both branches.
-
----
-
-## 9) Notes
-
-- WSS mode is still the correct choice for full L2 vpn-ws behavior.
-- HTTPS2 mode is experimental request/response payload transport.
-- You can tune handshake/request headers with `--header` and your own nginx rules.
+All are reachable by **IP address only**.

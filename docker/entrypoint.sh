@@ -18,6 +18,6 @@ fi
 
 envsubst '$CERT_CRT $CERT_KEY' < /etc/nginx/templates/lollipop.conf.template > /etc/nginx/conf.d/default.conf
 
-gunicorn -w 1 -b 127.0.0.1:18080 server_h2.h2_tunnel_server:app &
-/app/vpn-ws /run/lollipop/vpn.sock &
+gunicorn -w 1 -b 127.0.0.1:18080 server_h2.https2_payload_server:app &
+/app/lollipop-server /run/lollipop/vpn.sock &
 exec nginx -g 'daemon off;'
