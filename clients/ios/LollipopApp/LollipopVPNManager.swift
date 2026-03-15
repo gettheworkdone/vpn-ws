@@ -10,6 +10,7 @@ final class LollipopVPNManager: ObservableObject {
     @Published var username = "cucumber"
     @Published var password = "potato"
     @Published var protocolMode = "wss"
+    @Published var headersJSONText = "{}"
     @Published var statusMessage = "Idle"
     @Published var isConnected = false
 
@@ -17,6 +18,20 @@ final class LollipopVPNManager: ObservableObject {
 
     private init() {
         loadProfile()
+    }
+
+    func importHeadersFile(from url: URL) {
+        do {
+            let data = try Data(contentsOf: url)
+            guard let str = String(data: data, encoding: .utf8) else {
+                statusMessage = "Headers file is not UTF-8"
+                return
+            }
+            headersJSONText = str
+            statusMessage = "Headers JSON loaded"
+        } catch {
+            statusMessage = "Failed to load headers file: \(error.localizedDescription)"
+        }
     }
 
     func loadProfile() {
@@ -57,6 +72,7 @@ final class LollipopVPNManager: ObservableObject {
             "username": username as NSString,
             "password": password as NSString,
             "scheme": protocolMode as NSString,
+            "headers_json": headersJSONText as NSString,
         ]
 
         manager.localizedDescription = "Lollipop"

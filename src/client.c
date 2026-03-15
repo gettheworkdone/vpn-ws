@@ -13,8 +13,7 @@ static struct option vpn_ws_options[] = {
         {"crt", required_argument, NULL, 3 },
         {"user", required_argument, NULL, 4 },
         {"password", required_argument, NULL, 5 },
-        {"header", required_argument, NULL, 6 },
-        {"headers-json", required_argument, NULL, 7 },
+        {"headers-json", required_argument, NULL, 6 },
         {"no-verify", no_argument, &vpn_ws_conf.ssl_no_verify, 1 },
 	{"bridge", no_argument, &vpn_ws_conf.bridge, 1 },
         {NULL, 0, 0, 0}
@@ -597,11 +596,6 @@ int main(int argc, char *argv[]) {
                                 vpn_ws_conf.basic_auth_password = optarg;
                                 break;
                         case 6:
-                                if (vpn_ws_add_extra_header(optarg)) {
-                                        vpn_ws_exit(1);
-                                }
-                                break;
-                        case 7:
                                 if (vpn_ws_load_headers_json(optarg)) {
                                         vpn_ws_exit(1);
                                 }

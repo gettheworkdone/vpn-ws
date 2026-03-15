@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
-"""Lollipop desktop GUI wrapper for wss/ws and https2 transports."""
+"""Lollipop desktop GUI (Linux/macOS/Windows).
+
+Single GUI for both transports:
+- wss (true TAP VPN tunnel via lollipop-client)
+- https2 (experimental payload tunnel)
+"""
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -43,19 +49,21 @@ class LollipopWindow(QMainWindow):
         self.password = QLineEdit("potato")
         self.password.setEchoMode(QLineEdit.Password)
         self.cert = QLineEdit()
+        self.headers_json = QLineEdit(str(Path("config/browser_headers.example.json")))
         self.message = QLineEdit()
         self.message.setPlaceholderText("HTTPS2 payload to send")
 
-        self.proto_ws = QRadioButton("ws")
-        self.proto_wss = QRadioButton("wss")
-        self.proto_h2 = QRadioButton("https2")
+        self.proto_wss = QRadioButton("wss (true VPN)")
+        self.proto_h2 = QRadioButton("https2 (payload)")
         self.proto_wss.setChecked(True)
 
         self.output = QPlainTextEdit()
         self.output.setReadOnly(True)
 
-        browse = QPushButton("Browse cert")
-        browse.clicked.connect(self.pick_cert)
+        browse_cert = QPushButton("Browse cert")
+        browse_cert.clicked.connect(self.pick_cert)
+        browse_headers = QPushButton("Browse headers JSON")
+        browse_headers.clicked.connect(self.pick_headers_json)
 
         connect_btn = QPushButton("Connect")
         connect_btn.clicked.connect(self.connect_transport)
@@ -73,7 +81,6 @@ class LollipopWindow(QMainWindow):
         form.addRow("Password", self.password)
 
         proto_row = QHBoxLayout()
-        proto_row.addWidget(self.proto_ws)
         proto_row.addWidget(self.proto_wss)
         proto_row.addWidget(self.proto_h2)
         proto_wrap = QWidget()
@@ -82,10 +89,18 @@ class LollipopWindow(QMainWindow):
 
         cert_row = QHBoxLayout()
         cert_row.addWidget(self.cert)
-        cert_row.addWidget(browse)
+        cert_row.addWidget(browse_cert)
         cert_wrap = QWidget()
         cert_wrap.setLayout(cert_row)
-        form.addRow("CA / client cert", cert_wrap)
+        form.addRow("CA/client cert", cert_wrap)
+
+        hdr_row = QHBoxLayout()
+        hdr_row.addWidget(self.headers_json)
+        hdr_row.addWidget(browse_headers)
+        hdr_wrap = QWidget()
+        hdr_wrap.setLayout(hdr_row)
+        form.addRow("Headers JSON", hdr_wrap)
+
         form.addRow("HTTPS2 payload", self.message)
 
         controls = QHBoxLayout()
@@ -93,11 +108,11 @@ class LollipopWindow(QMainWindow):
         controls.addWidget(disconnect_btn)
         controls.addWidget(send_btn)
 
-        group = QGroupBox("Connection")
+        group = QGroupBox("Lollipop connection")
         group.setLayout(form)
 
         layout = QVBoxLayout()
-        layout.addWidget(QLabel("Lollipop GUI (ws/wss/https2)"))
+        layout.addWidget(QLabel("All controls are in GUI. Connect/Disconnect is safe and reversible."))
         layout.addWidget(group)
         layout.addLayout(controls)
         layout.addWidget(QLabel("Logs"))
@@ -112,6 +127,11 @@ class LollipopWindow(QMainWindow):
         if chosen:
             self.cert.setText(chosen)
 
+    def pick_headers_json(self) -> None:
+        chosen, _ = QFileDialog.getOpenFileName(self, "Select headers JSON", str(Path.home()), "JSON (*.json)")
+        if chosen:
+            self.headers_json.setText(chosen)
+
     def log(self, msg: str) -> None:
         self.output.appendPlainText(msg)
 
@@ -121,16 +141,30 @@ class LollipopWindow(QMainWindow):
             raise ValueError("Server IP is required")
         return f"[{ip}]" if ":" in ip and not ip.startswith("[") else ip
 
-    def build_ws_url(self) -> str:
+    def build_wss_url(self) -> str:
         host = self.host_fmt()
-        scheme = "wss" if self.proto_wss.isChecked() else "ws"
         path = self.path.text().strip().lstrip("/")
-        return f"{scheme}://{host}:{self.port.text().strip()}/{path}"
+        return f"wss://{host}:{self.port.text().strip()}/{path}"
 
     def build_h2_base(self) -> str:
         host = self.host_fmt()
         path = self.path.text().strip().lstrip("/")
         return f"https://{host}:{self.port.text().strip()}/{path}"
+
+    def validate_headers_json(self) -> str:
+        path = self.headers_json.text().strip()
+        if not path:
+            return ""
+        p = Path(path)
+        if not p.exists():
+            raise ValueError("Headers JSON path does not exist")
+        try:
+            loaded = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                raise ValueError("Headers JSON must be an object")
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"Invalid headers JSON: {exc}") from exc
+        return path
 
     def connect_transport(self) -> None:
         if self.process and self.process.state() != QProcess.NotRunning:
@@ -150,6 +184,7 @@ class LollipopWindow(QMainWindow):
         password = self.password.text()
 
         try:
+            hdr_path = self.validate_headers_json()
             if self.proto_h2.isChecked():
                 base = self.build_h2_base()
                 args = [
@@ -161,14 +196,18 @@ class LollipopWindow(QMainWindow):
                 ]
                 if self.cert.text().strip():
                     args.extend(["--cafile", self.cert.text().strip()])
+                if hdr_path:
+                    args.extend(["--headers-json", hdr_path])
                 self.log(f"[Lollipop] Starting HTTPS2 loop: python3 {' '.join(args)}")
                 self.process.start("python3", args)
             else:
-                url = self.build_ws_url()
+                url = self.build_wss_url()
                 args = ["--user", user, "--password", password]
                 cert = self.cert.text().strip()
                 if cert:
                     args.extend(["--crt", cert])
+                if hdr_path:
+                    args.extend(["--headers-json", hdr_path])
                 args.extend([self.tap.text().strip(), url])
                 self.log(f"[Lollipop] Starting lollipop-client {' '.join(args)}")
                 self.process.start("lollipop-client", args)
@@ -189,6 +228,7 @@ class LollipopWindow(QMainWindow):
 
         try:
             base = self.build_h2_base()
+            hdr_path = self.validate_headers_json()
         except ValueError as exc:
             QMessageBox.critical(self, "Lollipop", str(exc))
             return
@@ -206,6 +246,8 @@ class LollipopWindow(QMainWindow):
         cert = self.cert.text().strip()
         if cert:
             cmd.extend(["--cafile", cert])
+        if hdr_path:
+            cmd.extend(["--headers-json", hdr_path])
 
         try:
             out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
@@ -231,7 +273,7 @@ class LollipopWindow(QMainWindow):
 def main() -> int:
     app = QApplication(sys.argv)
     win = LollipopWindow()
-    win.resize(980, 680)
+    win.resize(1040, 720)
     win.show()
     return app.exec_()
 

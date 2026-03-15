@@ -19,6 +19,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
 
+        let headersJSON = cfg["headers_json"] as? String ?? "{}"
+        let extraHeaders = parseHeaders(jsonText: headersJSON)
+
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: serverIP)
         let ipv4 = NEIPv4Settings(addresses: ["10.99.0.2"], subnetMasks: ["255.255.255.0"])
         ipv4.includedRoutes = [NEIPv4Route.default()]
@@ -31,21 +34,35 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
 
             if scheme == "https2" {
-                self?.startHTTPS2Polling(serverIP: serverIP, port: port, path: path, username: username, password: password)
+                self?.startHTTPS2Polling(serverIP: serverIP, port: port, path: path, username: username, password: password, extraHeaders: extraHeaders)
             } else {
-                self?.startWebSocket(serverIP: serverIP, port: port, path: path, username: username, password: password)
+                self?.startWebSocket(serverIP: serverIP, port: port, path: path, username: username, password: password, extraHeaders: extraHeaders)
             }
             completionHandler(nil)
         }
     }
 
-    private func startWebSocket(serverIP: String, port: String, path: String, username: String, password: String) {
+    private func parseHeaders(jsonText: String) -> [String: String] {
+        guard let data = jsonText.data(using: .utf8) else { return [:] }
+        guard let obj = try? JSONSerialization.jsonObject(with: data) else { return [:] }
+        guard let dict = obj as? [String: Any] else { return [:] }
+        var ret: [String: String] = [:]
+        for (k, v) in dict {
+            ret[k] = "\(v)"
+        }
+        return ret
+    }
+
+    private func startWebSocket(serverIP: String, port: String, path: String, username: String, password: String, extraHeaders: [String: String]) {
         let host = serverIP.contains(":") ? "[\(serverIP)]" : serverIP
         guard let url = URL(string: "wss://\(host):\(port)/\(path)") else { return }
 
         var request = URLRequest(url: url)
         let authRaw = "\(username):\(password)"
         request.setValue("Basic \(Data(authRaw.utf8).base64EncodedString())", forHTTPHeaderField: "Authorization")
+        for (k, v) in extraHeaders {
+            request.setValue(v, forHTTPHeaderField: k)
+        }
 
         websocketTask = session.webSocketTask(with: request)
         websocketTask?.resume()
@@ -58,7 +75,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    private func startHTTPS2Polling(serverIP: String, port: String, path: String, username: String, password: String) {
+    private func startHTTPS2Polling(serverIP: String, port: String, path: String, username: String, password: String, extraHeaders: [String: String]) {
         let host = serverIP.contains(":") ? "[\(serverIP)]" : serverIP
         guard let recvURL = URL(string: "https://\(host):\(port)/\(path)/recv") else { return }
         let auth = "Basic \(Data("\(username):\(password)".utf8).base64EncodedString())"
@@ -67,6 +84,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             var req = URLRequest(url: recvURL)
             req.setValue(auth, forHTTPHeaderField: "Authorization")
             req.setValue(username, forHTTPHeaderField: "X-Client-Id")
+            for (k, v) in extraHeaders {
+                req.setValue(v, forHTTPHeaderField: k)
+            }
             self.session.dataTask(with: req).resume()
         }
     }

@@ -1,112 +1,89 @@
 # Lollipop
 
-Lollipop is a transport toolkit with two modes:
+Lollipop is an IP-only deployable tunneling system with two client-selectable transports:
 
-1. **True VPN mode (recommended):** `wss` + TAP (Layer-2 tunnel), using `lollipop-server` and `lollipop-client`.
-2. **HTTPS2 payload mode (experimental):** request/response payload transport over HTTPS.
+1. **WSS mode (true VPN mode)**: Layer-2 TAP tunnel over secure websocket (`wss`).
+2. **HTTPS2 mode (experimental)**: request/response payload channel over HTTPS.
 
-Everything works with **IP-only server setup** (no domain required).
+Server side is Linux (Ubuntu) and Docker-based. Client side is Linux, macOS, Windows and iOS.
 
 ---
 
-## 1) Project file map (what each file does)
+## 1. Overview
 
-### Core C implementation
+### 1.1 Architecture
 
-- `src/main.c` - server event loop entry point.
-- `src/client.c` - native client entry point and websocket handshake logic.
-- `src/io.c` - frame forwarding between TAP and websocket peers.
-- `src/tuntap.c` - TAP/TUN device creation and I/O.
-- `src/socket.c` - bind/connect helpers (IPv4/IPv6/unix socket).
-- `src/ssl.c` - TLS handling for native client.
-- `src/uwsgi.c` - nginx/uWSGI request parsing and websocket upgrade response.
-- `src/vpn-ws.h` - shared structures and function declarations.
+- **Server runtime**: `lollipop-server` behind nginx inside Docker.
+- **Client runtime**:
+  - Linux: GUI + CLI
+  - macOS: GUI
+  - Windows: GUI (no CLI requirement)
+  - iOS: GUI app + Packet Tunnel extension
+- **Security**: self-signed certificate generated for IP SAN; no domain required.
 
-### Build and packaging
+### 1.2 What is “true VPN” here?
 
-- `Makefile` - builds `lollipop-server`, `lollipop-client` and compatibility copies (`vpn-ws`, `vpn-ws-client`).
-- `docker/Dockerfile` - docker server image.
-- `docker/entrypoint.sh` - container startup, cert generation, starts nginx + backend services.
+Use **WSS + TAP** mode and route default traffic through the tunnel interface.
+
+- Linux/macOS: route control done by client-side network settings (documented below).
+- iOS: route control done in `PacketTunnelProvider` network settings.
+- HTTPS2 mode is experimental and not equivalent to full L2 VPN transport.
+
+---
+
+## 2. Repository map (file-by-file purpose)
+
+### Core C runtime
+
+- `src/main.c` - server entry/event loop.
+- `src/client.c` - native client (WSS transport, auth, headers JSON handling).
+- `src/io.c` - frame forwarding logic.
+- `src/tuntap.c` - TAP creation and TAP I/O.
+- `src/socket.c` - IPv4/IPv6/unix socket helpers.
+- `src/ssl.c` - TLS support for client.
+- `src/uwsgi.c` - nginx/uWSGI integration + handshake response.
+- `src/vpn-ws.h` - shared structs and declarations.
+
+### Build/runtime packaging
+
+- `Makefile` - builds `lollipop-server` and `lollipop-client` (+ compatibility copies).
+- `docker/Dockerfile` - full server image.
+- `docker/entrypoint.sh` - startup + cert generation + process launch.
 - `docker/nginx.conf.template` - nginx routes for WSS and HTTPS2 modes.
 
 ### HTTPS2 experimental transport
 
-- `server_h2/https2_payload_server.py` - simple queue-based payload server (`/send`, `/recv`).
-- `clients/https2_payload_cli.py` - one-shot send/recv CLI for HTTPS2 mode.
-- `clients/https2_payload_poll.py` - long-poll receiver helper.
-- `clients/utls/main.go` - uTLS-based HTTPS2 client (browser-like TLS fingerprint).
-- `clients/utls/go.mod`, `clients/utls/go.sum` - Go module dependencies.
+- `server_h2/https2_payload_server.py` - queue-based send/recv service.
+- `clients/https2_payload_cli.py` - one-shot send/recv client.
+- `clients/https2_payload_poll.py` - long-poll receive loop.
+- `clients/utls/main.go` - uTLS HTTP/2 client (browser-like TLS fingerprint).
 
-### Desktop clients
+### Desktop GUI clients
 
-- `clients/lollipop_gui.py` - desktop GUI with protocol switch (`ws`, `wss`, `https2`).
-- `clients/linux/lollipop.sh` - Linux launcher.
-- `clients/macos/lollipop.command` - macOS launcher.
-- `clients/windows/lollipop.bat` - Windows launcher.
+- `clients/lollipop_gui.py` - main desktop GUI.
+- `clients/linux/lollipop.sh` - Linux GUI launcher.
+- `clients/macos/lollipop.command` - macOS GUI launcher.
+- `clients/windows/lollipop.bat` - Windows GUI launcher.
 
 ### iOS client
 
-- `clients/ios/LollipopApp/LollipopApp.swift` - SwiftUI app root.
-- `clients/ios/LollipopApp/ContentView.swift` - iOS UI and protocol selector (`wss`/`https2`).
-- `clients/ios/LollipopApp/LollipopVPNManager.swift` - profile save/load and tunnel start/stop.
-- `clients/ios/LollipopTunnel/PacketTunnelProvider.swift` - packet tunnel extension logic.
-- `clients/ios/README.md` - full Xcode from-scratch build guide.
+- `clients/ios/LollipopApp/LollipopApp.swift` - app entry.
+- `clients/ios/LollipopApp/ContentView.swift` - app UI.
+- `clients/ios/LollipopApp/LollipopVPNManager.swift` - profile/config management.
+- `clients/ios/LollipopTunnel/PacketTunnelProvider.swift` - tunnel extension logic.
+- `clients/ios/README.md` - exhaustive iOS build/deploy steps.
 
-### Config
+### Config templates
 
-- `config/browser_headers.example.json` - sample header configuration JSON for `--headers-json`.
-
----
-
-## 2) Build binaries
-
-```bash
-make clean
-make
-```
-
-Output binaries:
-
-- `./lollipop-server`
-- `./lollipop-client`
-
-Compatibility copies also generated:
-
-- `./vpn-ws`
-- `./vpn-ws-client`
+- `config/browser_headers.example.json` - full headers template for request customization.
 
 ---
 
-## 3) Header customization JSON
+## 3. Installation and dependencies
 
-Lollipop client now supports:
+## 3.1 Server side (Ubuntu only)
 
-- `--header "Name: Value"` (repeatable)
-- `--headers-json /path/to/file.json`
-
-Example JSON (`config/browser_headers.example.json`):
-
-```json
-{
-  "User-Agent": "Mozilla/5.0 ...",
-  "Accept": "text/html,...",
-  "Accept-Language": "en-US,en;q=0.9"
-}
-```
-
-Usage:
-
-```bash
-sudo ./lollipop-client \
-  --user cucumber \
-  --password potato \
-  --headers-json ./config/browser_headers.example.json \
-  vpn-ws0 wss://127.0.0.1/cucumber
-```
-
----
-
-## 4) Install Docker on Ubuntu VPS
+### Install Docker on Ubuntu VPS
 
 ```bash
 sudo apt update
@@ -126,17 +103,15 @@ sudo systemctl enable docker
 sudo systemctl start docker
 ```
 
----
-
-## 5) Run server in Docker (IP only, no domain)
-
-### Build image
+### Build server image
 
 ```bash
+git clone <your-fork-or-repo-url> lollipop
+cd lollipop
 docker build -t lollipop-server -f docker/Dockerfile .
 ```
 
-### Run container
+### Run server container (IP-only)
 
 ```bash
 docker run -d \
@@ -148,149 +123,234 @@ docker run -d \
   lollipop-server
 ```
 
-### Certificate paths (generated automatically)
+### Generated certificate paths
 
-- cert: `/data/certs/cucumber.crt`
-- key: `/data/certs/potato.key`
+- `/data/certs/cucumber.crt`
+- `/data/certs/potato.key`
 
-Copy cert to host:
+Copy public cert:
 
 ```bash
 docker cp lollipop-server:/data/certs/cucumber.crt ./cucumber.crt
 ```
 
-Then install/trust `cucumber.crt` on clients.
+---
+
+## 3.2 Linux client dependencies
+
+### GUI mode
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-pip
+python3 -m pip install --user PyQt5 requests
+```
+
+### CLI mode (Linux only)
+
+```bash
+sudo apt install -y build-essential make gcc libssl-dev
+make clean
+make
+```
 
 ---
 
-## 6) Localhost Linux test (verified flow)
+## 3.3 macOS client dependencies
 
-### A. Start HTTPS2 test server locally
-
-```bash
-python3 -m pip install --user flask requests
-python3 server_h2/https2_payload_server.py
-```
-
-### B. In second terminal, send then receive
+- Install Python 3 (Homebrew or python.org)
+- Install GUI dependencies:
 
 ```bash
-python3 clients/https2_payload_cli.py --base http://127.0.0.1:18080 --client-id test1 --send "hello-local"
-python3 clients/https2_payload_cli.py --base http://127.0.0.1:18080 --client-id test1 --recv
+python3 -m pip install PyQt5 requests
 ```
 
-Expected: `hello-local` is returned.
+- Install TAP driver if using true WSS VPN mode.
 
 ---
 
-## 7) True VPN requirement (route all traffic)
+## 3.4 Windows client dependencies (GUI only)
 
-For **full-device traffic routing**, use **WSS mode + TAP + default route changes**.
+- Install Python 3.11+ (enable “Add python to PATH”).
+- Install dependencies:
 
-### Linux example (all traffic)
+```powershell
+py -m pip install PyQt5 requests
+```
+
+- Build binaries once (on Windows with build toolchain) or use provided/prebuilt `lollipop-client.exe` in your packaging flow.
+- Launch GUI via `clients\windows\lollipop.bat`.
+
+> Windows usage is GUI-first in this project; terminal operation is not required.
+
+---
+
+## 3.5 iOS client dependencies
+
+- macOS + Xcode 15+
+- Apple Developer account with NetworkExtension capability
+- Real iPhone/iPad for deployment
+
+Detailed click-by-click instructions are in `clients/ios/README.md`.
+
+---
+
+## 4. Common client options (same concept across all GUIs)
+
+All GUI clients expose the same conceptual fields:
+
+- Server IP
+- Port
+- Path
+- Username
+- Password
+- Protocol selector: `wss` / `https2`
+- Headers JSON config
+- Connect button
+- Disconnect button
+
+Desktop GUI also includes optional cert path and HTTPS2 send payload helper.
+
+---
+
+## 5. Headers JSON config (only JSON, no manual header flags)
+
+Use `config/browser_headers.example.json` as your template and edit values.
+
+Linux CLI usage (Linux only):
 
 ```bash
-sudo ./lollipop-client --user cucumber --password potato vpn-ws0 wss://203.0.113.10/cucumber
+sudo ./lollipop-client \
+  --user cucumber \
+  --password potato \
+  --headers-json ./config/browser_headers.example.json \
+  vpn-ws0 wss://203.0.113.10/cucumber
+```
+
+Desktop GUI / iOS:
+- choose/import this JSON from GUI.
+
+---
+
+## 6. End-to-end usage
+
+## 6.1 Linux GUI
+
+```bash
+./clients/linux/lollipop.sh
+```
+
+### Linux GUI visual map
+
+- **Top fields**: server IP/port/path/user/password
+- **Protocol selector**: `wss` or `https2`
+- **Headers JSON**: file path + browse button
+- **Buttons**:
+  - `Connect`
+  - `Disconnect`
+  - `Send HTTPS2 payload`
+- **Logs panel**: connection and runtime messages
+
+## 6.2 macOS GUI
+
+```bash
+./clients/macos/lollipop.command
+```
+
+Visual layout and controls are the same as Linux GUI.
+
+## 6.3 Windows GUI
+
+```bat
+clients\windows\lollipop.bat
+```
+
+Visual layout and controls are the same as Linux GUI.
+
+## 6.4 iOS GUI
+
+Follow `clients/ios/README.md` and run app on device.
+
+### iOS visual map
+
+- **Server section**: IP, port, path, protocol segmented control
+- **Authentication section**: username/password
+- **Headers JSON section**: import button + JSON editor text area
+- **Actions**: Save Profile, Connect/Disconnect
+- **Status section**: current state/errors
+
+---
+
+## 7. True VPN routing behavior
+
+## 7.1 Linux full-traffic example
+
+After WSS connection:
+
+```bash
 sudo ip link set vpn-ws0 up
 sudo ip addr add 10.99.0.2/24 dev vpn-ws0
 sudo ip route replace default dev vpn-ws0
 ```
 
-### macOS example (all traffic)
-
-1. Install TAP driver.
-2. Start client:
+To revert:
 
 ```bash
-sudo ./lollipop-client --user cucumber --password potato /dev/tap0 wss://203.0.113.10/cucumber
+sudo dhclient
 ```
 
-3. Assign address and default route (example):
+## 7.2 macOS full-traffic example
+
+After WSS connection:
 
 ```bash
 sudo ifconfig tap0 10.99.0.3 10.99.0.1 up
 sudo route change default 10.99.0.1
 ```
 
-### iOS
+To revert default route back to your normal gateway.
 
-On iOS, full-device routing is controlled by the Packet Tunnel extension and network settings set in `PacketTunnelProvider.swift`.
+## 7.3 iOS
 
-> HTTPS2 mode is experimental payload transport and not equivalent to full L2 VPN behavior.
-
----
-
-## 8) Desktop client usage (Linux + macOS + Windows)
-
-### Install dependencies
-
-Linux/macOS:
-
-```bash
-python3 -m pip install PyQt5 requests
-```
-
-### Launch
-
-Linux:
-
-```bash
-./clients/linux/lollipop.sh
-```
-
-macOS:
-
-```bash
-./clients/macos/lollipop.command
-```
-
-Windows:
-
-```bat
-clients\windows\lollipop.bat
-```
-
-In GUI choose protocol:
-
-- `wss` for true VPN tunnel
-- `https2` for payload mode
+Route behavior is controlled by `NEPacketTunnelNetworkSettings` in `PacketTunnelProvider.swift`.
 
 ---
 
-## 9) iOS full build from scratch
+## 8. Build iOS app from scratch
 
-Read and follow:
+Use `clients/ios/README.md`.
 
-- `clients/ios/README.md`
-
-That document includes:
-
-- project creation fields,
-- extension creation,
-- bundle IDs/signing,
-- capability setup,
-- device deployment,
-- certificate trust and troubleshooting.
+That guide includes exact Xcode UI flow:
+- what to click,
+- which template to choose,
+- which bundle identifiers to set,
+- where to add capabilities,
+- how to deploy to physical iPhone.
 
 ---
 
-## 10) uTLS client (browser-like TLS fingerprint)
+## 9. Testing checklist (from this README flow)
 
-```bash
-cd clients/utls
-go mod tidy
-go run . --base https://203.0.113.10/potato_h2 --client-id test1 --send "hello"
-go run . --base https://203.0.113.10/potato_h2 --client-id test1 --recv
-```
+- Build native binaries.
+- Validate Python client scripts syntax.
+- Validate Go uTLS client build.
+- Localhost HTTPS2 send/recv smoke test.
 
-This uses `utls.HelloChrome_Auto`.
+(See “Tests run” section below for executed commands.)
 
 ---
 
-## 11) WSS and HTTPS2 endpoints in docker nginx
+## 10. Tests run for this revision
 
-- WSS path: `/cucumber`
-- HTTPS2 send path: `/potato_h2/send`
-- HTTPS2 recv path: `/potato_h2/recv`
+Executed in Linux environment:
 
-All are reachable by **IP address only**.
+1. `make clean && make`
+2. `python3 -m py_compile clients/lollipop_gui.py clients/https2_payload_cli.py clients/https2_payload_poll.py server_h2/https2_payload_server.py`
+3. `cd clients/utls && go build .`
+4. Installed required Python deps for local tests:
+   - `python3 -m pip install --user requests flask`
+5. Localhost integration test:
+   - `python3 server_h2/https2_payload_server.py`
+   - `python3 clients/https2_payload_cli.py --base http://127.0.0.1:18080 --client-id test1 --send "hello-local"`
+   - `python3 clients/https2_payload_cli.py --base http://127.0.0.1:18080 --client-id test1 --recv`
+   - verified payload round-trip.

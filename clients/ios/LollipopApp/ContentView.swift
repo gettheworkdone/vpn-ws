@@ -1,7 +1,9 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var vpnManager = LollipopVPNManager.shared
+    @State private var showFileImporter = false
 
     var body: some View {
         NavigationView {
@@ -30,6 +32,15 @@ struct ContentView: View {
                     SecureField("Password", text: $vpnManager.password)
                 }
 
+                Section("Headers JSON") {
+                    Button("Import headers JSON file") {
+                        showFileImporter = true
+                    }
+                    TextEditor(text: $vpnManager.headersJSONText)
+                        .frame(minHeight: 120)
+                        .font(.system(.footnote, design: .monospaced))
+                }
+
                 Section("Actions") {
                     Button("Save Profile") {
                         vpnManager.saveProfile()
@@ -45,6 +56,20 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("Lollipop")
+            .fileImporter(
+                isPresented: $showFileImporter,
+                allowedContentTypes: [UTType.json],
+                allowsMultipleSelection: false
+            ) { result in
+                switch result {
+                case .success(let urls):
+                    if let first = urls.first {
+                        vpnManager.importHeadersFile(from: first)
+                    }
+                case .failure(let err):
+                    vpnManager.statusMessage = "Import error: \(err.localizedDescription)"
+                }
+            }
         }
     }
 }
