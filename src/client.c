@@ -11,10 +11,90 @@ static struct option vpn_ws_options[] = {
         {"exec", required_argument, NULL, 1 },
         {"key", required_argument, NULL, 2 },
         {"crt", required_argument, NULL, 3 },
+        {"user", required_argument, NULL, 4 },
+        {"password", required_argument, NULL, 5 },
+        {"header", required_argument, NULL, 6 },
+        {"headers-json", required_argument, NULL, 7 },
         {"no-verify", no_argument, &vpn_ws_conf.ssl_no_verify, 1 },
 	{"bridge", no_argument, &vpn_ws_conf.bridge, 1 },
         {NULL, 0, 0, 0}
 };
+
+
+static int vpn_ws_add_extra_header(char *header) {
+	if (vpn_ws_conf.extra_headers_n >= 32) {
+		vpn_ws_warning("too many headers (max 32)");
+		return -1;
+	}
+	vpn_ws_conf.extra_headers[vpn_ws_conf.extra_headers_n++] = header;
+	return 0;
+}
+
+static int vpn_ws_load_headers_json(char *path) {
+	FILE *fp = fopen(path, "rb");
+	if (!fp) {
+		vpn_ws_error("vpn_ws_load_headers_json()/fopen()");
+		return -1;
+	}
+	if (fseek(fp, 0, SEEK_END)) {
+		fclose(fp);
+		return -1;
+	}
+	long flen = ftell(fp);
+	if (flen <= 0 || flen > 65535) {
+		fclose(fp);
+		vpn_ws_warning("invalid headers json size");
+		return -1;
+	}
+	rewind(fp);
+	char *json = vpn_ws_calloc(flen + 1);
+	if (!json) {
+		fclose(fp);
+		return -1;
+	}
+	if (fread(json, 1, flen, fp) != (size_t)flen) {
+		free(json);
+		fclose(fp);
+		return -1;
+	}
+	fclose(fp);
+
+	char *ptr = json;
+	while ((ptr = strchr(ptr, '"'))) {
+		char *k_start = ptr + 1;
+		char *k_end = strchr(k_start, '"');
+		if (!k_end) break;
+		char *colon = strchr(k_end + 1, ':');
+		if (!colon) break;
+		char *v_quote = strchr(colon + 1, '"');
+		if (!v_quote) break;
+		char *v_start = v_quote + 1;
+		char *v_end = strchr(v_start, '"');
+		if (!v_end) break;
+
+		size_t key_len = k_end - k_start;
+		size_t val_len = v_end - v_start;
+		if (key_len == 0 || val_len == 0) {
+			ptr = v_end + 1;
+			continue;
+		}
+		char *hdr = vpn_ws_calloc(key_len + 2 + val_len + 1);
+		if (!hdr) {
+			free(json);
+			return -1;
+		}
+		snprintf(hdr, key_len + 2 + val_len + 1, "%.*s: %.*s", (int)key_len, k_start, (int)val_len, v_start);
+		if (vpn_ws_add_extra_header(hdr)) {
+			free(hdr);
+			free(json);
+			return -1;
+		}
+		ptr = v_end + 1;
+	}
+
+	free(json);
+	return 0;
+}
 
 #ifdef __WIN32__
 /*
@@ -210,6 +290,9 @@ int vpn_ws_client_write(vpn_ws_peer *peer, uint8_t *buf, uint64_t len) {
 
 int vpn_ws_connect(vpn_ws_peer *peer, char *name) {
 	static char *cpy = NULL;
+	static char *raw_userinfo = NULL;
+	char *host_hdr = NULL;
+	char *connect_host = NULL;
 
 	if (cpy) free(cpy);
 	cpy = strdup(name);
@@ -236,7 +319,7 @@ int vpn_ws_connect(vpn_ws_peer *peer, char *name) {
 
 	char *path = NULL;
 
-	// now get the domain part
+	// now get the host part
 	char *domain = cpy + 5 + ssl;
 	size_t domain_len = strlen(domain);
 	char *slash = strchr(domain, '/');
@@ -246,66 +329,146 @@ int vpn_ws_connect(vpn_ws_peer *peer, char *name) {
 		path = slash + 1;
 	}
 
-	// check for basic auth
+	// check for basic auth in url (userinfo)
 	char *at = strchr(domain, '@');
 	if (at) {
 		*at = 0;
 		domain = at+1;
 		domain_len = strlen(domain);
+		raw_userinfo = cpy + 5 + ssl;
+	}
+	else {
+		raw_userinfo = NULL;
 	}
 
-	// check for port
-	char *port_str = strchr(domain, ':');
-	if (port_str) {		
-		*port_str = 0;
-		domain_len = strlen(domain);
-		port = atoi(port_str+1);
+	// parse host and optional port, with support for [ipv6]:port
+	char *port_str = NULL;
+	int ipv6_literal = 0;
+	if (domain[0] == '[') {
+		char *close_bracket = strchr(domain, ']');
+		if (!close_bracket) {
+			vpn_ws_warning("invalid websocket url: missing ']' in host");
+			return -1;
+		}
+		ipv6_literal = 1;
+		if (close_bracket[1] == ':') {
+			port_str = close_bracket + 1;
+			*port_str = 0;
+			port = atoi(port_str+1);
+		}
+		domain++;
+		*close_bracket = 0;
+	}
+	else {
+		port_str = strrchr(domain, ':');
+		if (port_str && !strchr(port_str+1, ':')) {
+			*port_str = 0;
+			port = atoi(port_str+1);
+		}
 	}
 
-	vpn_ws_notice("connecting to %s port %u (transport: %s)", domain, port, ssl ? "wss": "ws");
+	domain_len = strlen(domain);
 
-	// resolve the domain
-#ifndef __WIN32__
-	res_init();
-#endif
-	struct hostent *he = gethostbyname(domain);
-	if (!he) {
-		vpn_ws_warning("vpn_ws_connect()/gethostbyname(): unable to resolve name");
+	if (ipv6_literal) {
+		host_hdr = vpn_ws_calloc(domain_len + 3 + (port_str ? strlen(port_str+1) + 1 : 0));
+		if (!host_hdr) return -1;
+		if (port_str) {
+			snprintf(host_hdr, domain_len + 3 + strlen(port_str+1) + 1, "[%s]:%s", domain, port_str+1);
+		}
+		else {
+			snprintf(host_hdr, domain_len + 3, "[%s]", domain);
+		}
+	}
+	else {
+		host_hdr = vpn_ws_calloc(domain_len + 1 + (port_str ? strlen(port_str+1) + 1 : 0));
+		if (!host_hdr) return -1;
+		if (port_str) {
+			snprintf(host_hdr, domain_len + 1 + strlen(port_str+1) + 1, "%s:%s", domain, port_str+1);
+		}
+		else {
+			snprintf(host_hdr, domain_len + 1, "%s", domain);
+		}
+	}
+
+	connect_host = vpn_ws_calloc(domain_len + 1);
+	if (!connect_host) {
+		free(host_hdr);
+		return -1;
+	}
+	snprintf(connect_host, domain_len + 1, "%s", domain);
+
+	vpn_ws_notice("connecting to %s port %u (transport: %s)", connect_host, port, ssl ? "wss": "ws");
+
+	struct addrinfo hints;
+	struct addrinfo *res = NULL;
+	struct addrinfo *rp = NULL;
+	char port_num[6];
+	memset(&hints, 0, sizeof(struct addrinfo));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	snprintf(port_num, sizeof(port_num), "%u", port);
+
+	if (getaddrinfo(connect_host, port_num, &hints, &res)) {
+		vpn_ws_warning("vpn_ws_connect()/getaddrinfo(): unable to resolve name");
+		free(connect_host);
+		free(host_hdr);
 		return -1;
 	}
 
+	for(rp = res; rp != NULL; rp = rp->ai_next) {
 #ifndef __WIN32__
-	peer->fd = socket(AF_INET, SOCK_STREAM, 0);
+		peer->fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
 #else
-	peer->fd = _vpn_ws_win32_socket(AF_INET, SOCK_STREAM, 0);
+		peer->fd = _vpn_ws_win32_socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
 #endif
-	if (vpn_ws_is_invalid_fd(peer->fd)) {
-		vpn_ws_error("vpn_ws_connect()/socket()");
-		return -1;
+		if (vpn_ws_is_invalid_fd(peer->fd)) {
+			continue;
+		}
+
+		if (!connect(vpn_ws_socket_cast(peer->fd), rp->ai_addr, rp->ai_addrlen)) {
+			break;
+		}
+		close(peer->fd);
+		peer->fd = vpn_ws_invalid_fd;
 	}
 
-	struct sockaddr_in sin;
-	memset(&sin, 0, sizeof(struct sockaddr_in));
-	sin.sin_family = AF_INET;
-	sin.sin_port = htons(port);
-	sin.sin_addr = *((struct in_addr *) he->h_addr);
+	freeaddrinfo(res);
 
-	if (connect(vpn_ws_socket_cast(peer->fd), (struct sockaddr *) &sin, sizeof(struct sockaddr_in))) {
+	if (vpn_ws_is_invalid_fd(peer->fd)) {
 		vpn_ws_error("vpn_ws_connect()/connect()");
+		free(connect_host);
+		free(host_hdr);
 		return -1;
 	}
 
 	char *auth = NULL;
+	char *auth_src = NULL;
 
-	if (at) {
-		char *crd = cpy + 5 + ssl;
-		auth = vpn_ws_calloc(23 + (strlen(crd) * 2));
+	if (vpn_ws_conf.basic_auth_user) {
+		size_t user_len = strlen(vpn_ws_conf.basic_auth_user);
+		size_t pass_len = vpn_ws_conf.basic_auth_password ? strlen(vpn_ws_conf.basic_auth_password) : 0;
+		auth_src = vpn_ws_calloc(user_len + 1 + pass_len + 1);
+		if (!auth_src) {
+			free(connect_host);
+			return -1;
+		}
+		snprintf(auth_src, user_len + 1 + pass_len + 1, "%s:%s", vpn_ws_conf.basic_auth_user, vpn_ws_conf.basic_auth_password ? vpn_ws_conf.basic_auth_password : "");
+	}
+	else if (raw_userinfo) {
+		auth_src = raw_userinfo;
+	}
+
+	if (auth_src) {
+		auth = vpn_ws_calloc(23 + (strlen(auth_src) * 2));
 		if (!auth) {
+			if (vpn_ws_conf.basic_auth_user) free(auth_src);
+			free(connect_host);
 			return -1;
 		}
 		memcpy(auth, "Authorization: Basic ", 21);
-		uint16_t auth_len = vpn_ws_base64_encode((uint8_t *)crd, strlen(crd), (uint8_t *)auth + 21);
+		uint16_t auth_len = vpn_ws_base64_encode((uint8_t *)auth_src, strlen(auth_src), (uint8_t *)auth + 21);
 		memcpy(auth + 21 + auth_len, "\r\n", 2); 
+		if (vpn_ws_conf.basic_auth_user) free(auth_src);
 	}
 
 	uint8_t *mac = vpn_ws_conf.tuntap_mac;
@@ -319,12 +482,10 @@ int vpn_ws_connect(vpn_ws_peer *peer, char *name) {
 #endif
 	uint16_t key_len = vpn_ws_base64_encode(secret, 10, key);
 	// now build and send the request
-	char buf[8192];
-	int ret = snprintf(buf, 8192, "GET /%s HTTP/1.1\r\nHost: %s%s%s\r\n%sUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %.*s\r\nX-vpn-ws-MAC: %02x:%02x:%02x:%02x:%02x:%02x%s\r\n\r\n",
+	char buf[16384];
+	int ret = snprintf(buf, sizeof(buf), "GET /%s HTTP/1.1\r\nHost: %s\r\n%sUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %.*s\r\nX-vpn-ws-MAC: %02x:%02x:%02x:%02x:%02x:%02x%s\r\n",
 		path ? path : "",
-		domain,
-		port_str ? ":" : "",
-		port_str ? port_str+1 : "",
+		host_hdr,
 		auth ? auth : "",
 		key_len,
 		key,
@@ -337,24 +498,53 @@ int vpn_ws_connect(vpn_ws_peer *peer, char *name) {
 		vpn_ws_conf.bridge ? "\r\nX-vpn-ws-bridge: on" : ""
 	);
 
-	if (auth) free(auth);
+	if (ret > 0) {
+		uint8_t i;
+		for(i=0;i<vpn_ws_conf.extra_headers_n;i++) {
+			char *eh = vpn_ws_conf.extra_headers[i];
+			if (!eh) continue;
+			int hdr_len = snprintf(buf + ret, sizeof(buf) - ret, "%s\r\n", eh);
+			if (hdr_len <= 0 || hdr_len >= (int) (sizeof(buf) - ret)) {
+				ret = -1;
+				break;
+			}
+			ret += hdr_len;
+		}
+	}
 
-	if (ret == 0 || ret > 8192) {
+	if (ret > 0) {
+		int end_len = snprintf(buf + ret, sizeof(buf) - ret, "\r\n");
+		if (end_len <= 0 || end_len >= (int) (sizeof(buf) - ret)) {
+			ret = -1;
+		}
+		else {
+			ret += end_len;
+		}
+	}
+
+	if (auth) free(auth);
+	free(host_hdr);
+
+	if (ret <= 0 || ret > sizeof(buf)) {
 		vpn_ws_log("vpn_ws_connect()/snprintf()");
+		free(connect_host);
 		return -1;
 	}
 
 	if (ssl) {
 		vpn_ws_conf.ssl_ctx = vpn_ws_ssl_handshake(peer, domain, vpn_ws_conf.ssl_key, vpn_ws_conf.ssl_crt);
 		if (!vpn_ws_conf.ssl_ctx) {
+			free(connect_host);
 			return -1;
 		}
 		if (vpn_ws_ssl_write(vpn_ws_conf.ssl_ctx, (uint8_t *)buf, ret)) {
+			free(connect_host);
 			return -1;
 		}
 	}
 	else {
 		if (vpn_ws_full_write(peer->fd, buf, ret)) {
+			free(connect_host);
 			return -1;
 		}		
 	}
@@ -362,10 +552,12 @@ int vpn_ws_connect(vpn_ws_peer *peer, char *name) {
 	int http_code = vpn_ws_wait_101(peer->fd, vpn_ws_conf.ssl_ctx);
 	if (http_code != 101) {
 		vpn_ws_warning("error, websocket handshake returned code: %d", http_code);
+		free(connect_host);
 		return -1;
 	}
 
-	vpn_ws_notice("connected to %s port %u (transport: %s)", domain, port, ssl ? "wss": "ws");
+	vpn_ws_notice("connected to %s port %u (transport: %s)", connect_host, port, ssl ? "wss": "ws");
+	free(connect_host);
 	return 0;
 }
 
@@ -397,6 +589,22 @@ int main(int argc, char *argv[]) {
                                 break;
                         case 3:
                                 vpn_ws_conf.ssl_crt = optarg;
+                                break;
+                        case 4:
+                                vpn_ws_conf.basic_auth_user = optarg;
+                                break;
+                        case 5:
+                                vpn_ws_conf.basic_auth_password = optarg;
+                                break;
+                        case 6:
+                                if (vpn_ws_add_extra_header(optarg)) {
+                                        vpn_ws_exit(1);
+                                }
+                                break;
+                        case 7:
+                                if (vpn_ws_load_headers_json(optarg)) {
+                                        vpn_ws_exit(1);
+                                }
                                 break;
                         case '?':
                                 break;
